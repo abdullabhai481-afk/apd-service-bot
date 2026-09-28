@@ -45,20 +45,22 @@ async def run(fn, *args):
     return await asyncio.to_thread(fn, *args)
 
 
-def _get_last_msg(uid: int):
+def _get_state(uid: int):
     snap = db.collection(USERS).document(str(uid)).get()
     if snap.exists:
-        return (snap.to_dict() or {}).get("last_msg_id")
-    return None
+        d = snap.to_dict() or {}
+        return d.get("last_msg_id"), d.get("page") or 1
+    return None, 1
 
 
-def _save_user(user, msg_id, is_start: bool):
+def _save_user(user, msg_id, page: int, is_start: bool):
     ref = db.collection(USERS).document(str(user.id))
     data = {
         "name": user.full_name,
         "username": user.username,
         "last_seen": firestore.SERVER_TIMESTAMP,
         "last_msg_id": msg_id,
+        "page": page,
         "actions": firestore.Increment(1),
     }
     if is_start and not ref.get().exists:
@@ -134,13 +136,22 @@ def menu_text(page: int) -> str:
 
 
 # ---------------------------------------------------------------
-# ক্লিন চ্যাট + কম ঝিলিক:
-# - বাটনের লেখা (ইউজারের মেসেজ) মুছে যায়
-# - ফিচারের উত্তর আগের বটের মেসেজটাই এডিট করে দেখায় (নতুন মেসেজ নয়),
-#   তাই কীবোর্ড আর মেনু যেমন ছিল তেমনই থাকে
-# - শুধু পেজ বদলালে নতুন কীবোর্ড পাঠাতে হয়
-# - আগের মেসেজের আইডি Firebase এ থাকে, রিস্টার্টেও কাজ করে
+# ক্লিন চ্যাট + দ্রুত রেসপন্স:
+# - মেসেজ আগে পাঠানো হয়, মোছা/Firebase সেভ ব্যাকগ্রাউন্ডে হয় (তাই দেরি হয় না)
+# - ফিচারের উত্তরেও বর্তমান পেজের কীবোর্ড সাথে পাঠানো হয়, আর পুরনো মেসেজ
+#   মোছা হয় নতুনটা যাওয়ার পরে - তাই ⊞ মেনু আইকন কখনো সরে যায় না
+#   (মেসেজ এডিট করলে টেলিগ্রাম ক্লায়েন্ট কীবোর্ড সরিয়ে দিত, সেটাই সমস্যা ছিল)
 # ---------------------------------------------------------------
+_bg_tasks = set()
+
+
+def spawn(coro):
+    """ব্যাকগ্রাউন্ডে কাজ চালায়, হ্যান্ডলার আটকে থাকে না"""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
 async def safe_delete(bot, chat_id: int, message_id: int):
     try:
         await bot.delete_message(chat_id, message_id)
@@ -148,80 +159,80 @@ async def safe_delete(bot, chat_id: int, message_id: int):
         pass
 
 
-async def sweep_old(bot, chat_id: int, new_id: int, old_id):
-    """নতুন মেনুর আগের মেসেজগুলো (আগের মেনু/ফিচার মেসেজ) মুছে ফেলে।
+async def sweep_old(bot, chat_id: int, new_id: int, old_id, extra_id=None):
+    """নতুন মেসেজের আগের মেসেজগুলো (আগের মেনু/ফিচার মেসেজ) মুছে ফেলে।
     আগের মেসেজের আইডি হারিয়ে গেলেও কাজ করে।"""
     ids = {new_id - i for i in range(1, 13)}
     if old_id:
         ids.add(old_id)
+    if extra_id:
+        ids.add(extra_id)
     ids.discard(new_id)
     await asyncio.gather(*(safe_delete(bot, chat_id, i) for i in ids if i > 0))
 
 
-async def get_old_id(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
-    cache = context.bot_data.setdefault("last_msg", {})
-    old_id = cache.get(chat_id)
-    if old_id is None:
+async def get_state(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
+    """(আগের মেসেজ আইডি, বর্তমান পেজ) - আগে মেমরি ক্যাশ, না থাকলে Firebase"""
+    cache = context.bot_data.setdefault("state", {})
+    st = cache.get(chat_id)
+    if st is None:
+        old_id, page = None, 1
         try:
-            old_id = await run(_get_last_msg, user_id)
+            old_id, page = await run(_get_state, user_id)
         except Exception as e:
             logging.warning("firebase read error: %s", e)
-    return old_id
+        st = {"msg": old_id, "page": page if page in PAGES else 1}
+        cache[chat_id] = st
+    return st["msg"], st["page"]
 
 
-async def finish(context, user, chat_id: int, msg_id: int, is_start: bool):
-    context.bot_data.setdefault("last_msg", {})[chat_id] = msg_id
+async def save_bg(user, msg_id: int, page: int, is_start: bool):
     try:
-        await run(_save_user, user, msg_id, is_start)
+        await run(_save_user, user, msg_id, page, is_start)
     except Exception as e:
         logging.warning("firebase write error: %s", e)
 
 
-async def show_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                    page: int, is_start: bool = False):
+async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    page, text_fn, is_start: bool = False):
+    """page=None হলে বর্তমান পেজ ধরে নেয় (ফিচার বাটনের জন্য)"""
     chat_id = update.effective_chat.id
     user = update.effective_user
+    cache = context.bot_data.setdefault("state", {})
 
-    if update.message:
-        await safe_delete(context.bot, chat_id, update.message.message_id)
+    async def _send(p):
+        return await context.bot.send_message(
+            chat_id, text_fn(p), reply_markup=menu_keyboard(p)
+        )
 
-    old_id = await get_old_id(context, user.id, chat_id)
+    if chat_id in cache:
+        old_id, cur_page = cache[chat_id]["msg"], cache[chat_id]["page"]
+        use_page = cur_page if page is None else page
+        sent = await _send(use_page)
+    elif page is not None:
+        # ক্যাশ নেই (রিস্টার্টের পর প্রথমবার): মেসেজ পাঠানো আর Firebase রিড একসাথে
+        sent, st = await asyncio.gather(
+            _send(page), get_state(context, user.id, chat_id)
+        )
+        old_id, use_page = st[0], page
+    else:
+        old_id, use_page = await get_state(context, user.id, chat_id)
+        sent = await _send(use_page)
 
-    sent = await context.bot.send_message(
-        chat_id, menu_text(page), reply_markup=menu_keyboard(page)
-    )
-    await sweep_old(context.bot, chat_id, sent.message_id, old_id)
+    cache[chat_id] = {"msg": sent.message_id, "page": use_page}
 
-    await finish(context, user, chat_id, sent.message_id, is_start)
+    user_msg_id = update.message.message_id if update.message else None
+    spawn(sweep_old(context.bot, chat_id, sent.message_id, old_id, user_msg_id))
+    spawn(save_bg(user, sent.message_id, use_page, is_start))
+
+
+async def show_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    page: int, is_start: bool = False):
+    await send_menu(update, context, page, menu_text, is_start)
 
 
 async def show_feature(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    if update.message:
-        await safe_delete(context.bot, chat_id, update.message.message_id)
-
-    old_id = await get_old_id(context, user.id, chat_id)
-    new_id = None
-
-    if old_id:
-        try:
-            await context.bot.edit_message_text(text, chat_id=chat_id, message_id=old_id)
-            new_id = old_id
-        except BadRequest as e:
-            if "not modified" in str(e).lower():
-                new_id = old_id
-        except TelegramError:
-            pass
-
-    if new_id is None:
-        sent = await context.bot.send_message(chat_id, text)
-        new_id = sent.message_id
-        if old_id:
-            await safe_delete(context.bot, chat_id, old_id)
-
-    await finish(context, user, chat_id, new_id, False)
+    await send_menu(update, context, None, lambda p: text)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
