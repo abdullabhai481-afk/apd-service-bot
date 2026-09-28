@@ -11,6 +11,7 @@ import asyncio
 import logging
 import functools
 import threading
+from html import escape as h_esc
 
 import httpx
 import firebase_admin
@@ -21,6 +22,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InputFile,
     KeyboardButton,
+    LinkPreviewOptions,
     MenuButtonDefault,
     ReplyKeyboardMarkup,
     Update,
@@ -30,6 +32,7 @@ from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -88,6 +91,8 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 USERS = "users"
 USER_VOICES = "user_voices"   # প্রতি ইউজারের সেভ করা ভয়েস লিস্ট (চিরস্থায়ী)
+BOT_CHATS = "bot_chats"       # যেসব গ্রুপ/চ্যানেলে বট অ্যাডমিন (কে অ্যাডমিন বানিয়েছে সহ)
+REFER_POINTS = int(os.environ.get("REFER_POINTS", 1))   # প্রতি সফল রেফারে কত পয়েন্ট
 
 
 async def run(fn, *args):
@@ -155,6 +160,73 @@ def _find_uid(username: str):
         for d in docs:
             return int(d.id)
     return None
+
+
+# ---------- গ্রুপ/চ্যানেল ট্র্যাকিং (কে বটকে অ্যাডমিন বানিয়েছে) ----------
+def _save_chat(chat_id: int, data: dict):
+    db.collection(BOT_CHATS).document(str(chat_id)).set(data, merge=True)
+
+
+def _get_owned_chats(uid: int):
+    """এই ইউজার যেসব গ্রুপ/চ্যানেলে বটকে অ্যাডমিন বানিয়েছে (এখনো অ্যাডমিন আছে এমন)"""
+    out = []
+    for d in db.collection(BOT_CHATS).where("owner_id", "==", uid).stream():
+        x = d.to_dict() or {}
+        if x.get("admin"):
+            out.append({"id": int(d.id), "title": x.get("title") or d.id, "type": x.get("type") or "group"})
+    out.sort(key=lambda c: c["title"].lower())
+    return out
+
+
+def _mark_chat_inactive(chat_id: int):
+    ref = db.collection(BOT_CHATS).document(str(chat_id))
+    if ref.get().exists:
+        ref.set({"admin": False}, merge=True)
+
+
+# ---------- রেফার সিস্টেম ----------
+def _get_refer_stats(uid: int):
+    snap = db.collection(USERS).document(str(uid)).get()
+    d = (snap.to_dict() or {}) if snap.exists else {}
+    return int(d.get("referrals") or 0), int(d.get("points") or 0)
+
+
+def _process_referral(new_uid: int, ref_uid: int, name, username) -> bool:
+    """নতুন ইউজার (যার ডাটা আগে ছিল না) রেফার লিংকে স্টার্ট দিলে রেফারারকে পয়েন্ট দেয়।
+    Transaction ব্যবহার হয়, তাই একই ইউজারের জন্য দুইবার পয়েন্ট যাবে না।"""
+    if new_uid == ref_uid:
+        return False
+    users = db.collection(USERS)
+    new_ref = users.document(str(new_uid))
+    ref_ref = users.document(str(ref_uid))
+
+    @firestore.transactional
+    def txn(t):
+        if new_ref.get(transaction=t).exists:      # আগে থেকেই বটের ইউজার
+            return False
+        if not ref_ref.get(transaction=t).exists:  # রেফারার বটের ইউজার নয়
+            return False
+        t.set(
+            new_ref,
+            {
+                "name": name,
+                "username": username,
+                "referred_by": ref_uid,
+                "joined_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+        t.set(
+            ref_ref,
+            {
+                "points": firestore.Increment(REFER_POINTS),
+                "referrals": firestore.Increment(1),
+            },
+            merge=True,
+        )
+        return True
+
+    return txn(db.transaction())
 
 
 # ---------------------------------------------------------------
@@ -582,12 +654,147 @@ async def add_voice(st, v) -> bool:
     return True
 
 
+_VALID = {}                  # voice_id -> শেষবার কখন ঠিক আছে যাচাই হয়েছে
+VALID_TTL = 12 * 3600
+
+
+async def voice_exists(vid: str):
+    """True = ভয়েস আছে | False = নেই (404/আর্কাইভ) | None = যাচাই করা যায়নি (নেটওয়ার্ক/অন্য সমস্যা)"""
+    try:
+        r = await HTTP.get(f"{CARTESIA_URL}/voices/{vid}", headers=_auth(), timeout=20)
+    except Exception as e:
+        logging.warning("voice check error: %s", e)
+        return None
+    if r.status_code == 404:
+        return False
+    if r.status_code >= 400:
+        return None
+    try:
+        if (r.json() or {}).get("status") == "archived":
+            return False
+    except Exception:
+        pass
+    _VALID[vid] = time.time()
+    return True
+
+
+async def remove_voices(st, ids) -> int:
+    """ইউজারের সেভ লিস্ট থেকে অকার্যকর ভয়েস মুছে দেয়, কতটা মুছেছে ফেরত দেয়"""
+    lst = await get_user_voices(st)
+    left = [x for x in lst if x["id"] not in ids]
+    n = len(lst) - len(left)
+    if n:
+        lst[:] = left
+        for i in ids:
+            _VALID.pop(i, None)
+        try:
+            await run(_save_voices, st["uid"], lst)
+        except Exception as e:
+            logging.warning("voice prune save error: %s", e)
+    return n
+
+
+async def prune_dead_voices(st):
+    """ব্যাকগ্রাউন্ডে সেভ করা ভয়েসগুলো যাচাই করে, যেগুলো Cartesia তে আর নেই সেগুলো মুছে দেয়"""
+    try:
+        lst = await get_user_voices(st)
+        now = time.time()
+        todo = [v["id"] for v in lst if now - _VALID.get(v["id"], 0) > VALID_TTL]
+        if not todo:
+            return
+        sem = asyncio.Semaphore(5)
+
+        async def chk(vid):
+            async with sem:
+                return vid, await voice_exists(vid)
+
+        res = await asyncio.gather(*(chk(v) for v in todo))
+        dead = {vid for vid, ok in res if ok is False}
+        # নিরাপত্তা: একসাথে সবগুলো "নেই" দেখালে সম্ভবত API সমস্যা, তখন কিছু মুছবে না
+        if len(todo) >= 3 and len(dead) == len(todo):
+            logging.warning("voice prune skipped: all %s voices looked dead", len(todo))
+            return
+        if dead:
+            n = await remove_voices(st, dead)
+            logging.info("pruned %s dead voices for %s", n, st["uid"])
+    except Exception as e:
+        logging.warning("prune error: %s", e)
+
+
+# ---------------------------------------------------------------
+# রেফার পেজের লেখা (HTML)
+# ---------------------------------------------------------------
+async def refer_text(ctx) -> str:
+    user = ctx["user"]
+    bot_un = ctx.get("bot")
+    if not bot_un:
+        raise RuntimeError("বটের username পাওয়া যায়নি")
+    referrals, points = await run(_get_refer_stats, user.id)
+    link = f"https://t.me/{bot_un}?start=ref_{user.id}"
+    uname = f"@{h_esc(user.username)}" if user.username else "সেট করা নেই"
+    boxes = [
+        f"👤 <b>টেলিগ্রাম নাম</b>\n{h_esc(user.full_name)}",
+        f"🔖 <b>টেলিগ্রাম ইউজারনেম</b>\n{uname}",
+        f"🆔 <b>ইউজার আইডি</b> <i>(ট্যাপ করলে কপি হবে)</i>\n<code>{user.id}</code>",
+        f"🎯 <b>রেফার পয়েন্ট</b>\nপ্রতি সফল রেফারে <b>{REFER_POINTS} পয়েন্ট</b>",
+        f"🔗 <b>রেফার লিংক</b> <i>(ট্যাপ করলে কপি হবে)</i>\n<code>{h_esc(link)}</code>",
+        f"📊 <b>আপনার রেফার:</b> {referrals} জন\n💎 <b>আপনার পয়েন্ট:</b> {points}",
+    ]
+    body = "\n".join(f"<blockquote>{b}</blockquote>" for b in boxes)
+    return (
+        "🎁 <b>REFER &amp; EARN</b>\n"
+        "বন্ধুদের ইনভাইট করুন, পয়েন্ট জিতুন!\n\n"
+        f"{body}"
+    )
+
+
 # ---------------------------------------------------------------
 # মেনু রেন্ডার: (টেক্সট, কীবোর্ড, লেবেল→ভয়েস, ঠিক করা ভিউ)
 # ---------------------------------------------------------------
-async def render(view, st=None):
+async def render(view, st=None, ctx=None):
     n = view.get("n")
     labels = {}
+
+    if n == "refer":
+        text = await refer_text(ctx) if ctx else ""
+        return text, kb([[B(BTN_HOME, NAV_STYLE)]]), labels, V("refer")
+
+    if n == "pick":
+        err = False
+        try:
+            chats = await run(_get_owned_chats, st["uid"]) if st else []
+        except Exception as e:
+            logging.warning("owned chats error: %s", e)
+            chats, err = [], True
+        pages = max(1, math.ceil(len(chats) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for c in chats[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            label = uniq_label("📢" if c["type"] == "channel" else "👥", c["title"], labels)
+            labels[label] = c
+            btns.append(B(label))
+        rows = pair(btns)
+        nav = []
+        if pg > 0:
+            nav.append(B(BTN_VPREV, NAV_STYLE))
+        if pg < pages - 1:
+            nav.append(B(BTN_VNEXT, NAV_STYLE))
+        if nav:
+            rows.append(nav)
+        rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
+        text = "👥 Send Group/Channel\nলিস্ট থেকে বেছে নিন, অথবা গ্রুপ/চ্যানেলের ID বা @username লিখে পাঠান"
+        if err:
+            text += "\n\n⚠️ লিস্ট লোড হয়নি — ID বা @username লিখে পাঠান"
+        elif not chats:
+            text += (
+                "\n\n(কোনো গ্রুপ/চ্যানেল পাওয়া যায়নি। বটকে আপনার গ্রুপ/চ্যানেলে "
+                "অ্যাডমিন বানালে এখানে দেখাবে)"
+            )
+        else:
+            text += "\n\n(যেসব গ্রুপ/চ্যানেলে আপনি বটকে অ্যাডমিন বানিয়েছেন)"
+            if pages > 1:
+                text += f" ({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("pick", p=pg)
 
     if n == "voice":
         rows = [
@@ -730,12 +937,17 @@ async def save_bg(user, msg_id: int, view, keep, is_start: bool):
 
 
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                    text, markup, view=None, is_start: bool = False):
+                    text, markup, view=None, is_start: bool = False, html: bool = False):
     chat_id = update.effective_chat.id
     user = update.effective_user
     cache = context.bot_data.setdefault("state", {})
 
     async def _send():
+        if html:
+            return await context.bot.send_message(
+                chat_id, text, reply_markup=markup, parse_mode="HTML",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
         return await context.bot.send_message(chat_id, text, reply_markup=markup)
 
     st = cache.get(chat_id)
@@ -765,21 +977,32 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
     chat_id = update.effective_chat.id
     user = update.effective_user
     st = context.bot_data.setdefault("state", {}).get(chat_id)
-    if st is None and view.get("n") == "create":
+    if st is None and view.get("n") in ("create", "pick"):
         st = await get_state(context, user.id, chat_id)
     try:
-        rtext, markup, labels, view = await render(view, st)
+        rtext, markup, labels, view = await render(
+            view, st, {"user": user, "bot": context.bot.username}
+        )
     except Exception as e:
         logging.warning("render error: %s", e)
-        rtext, markup, labels, view = await render(V("voice"))
+        if view.get("n") == "refer":
+            fb, err = MAIN1, "❌ রেফার পেজ লোড হয়নি, আবার চেষ্টা করুন"
+        else:
+            fb, err = V("voice"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
+        rtext, markup, labels, view = await render(fb)
         text = None
-        extra = f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
+        extra = err
+    is_html = view.get("n") == "refer"
     final = text if text is not None else rtext
     if extra:
-        final = f"{extra}\n\n{final}"
-    st = await send_menu(update, context, final, markup, view, is_start)
+        final = f"{h_esc(extra) if is_html else extra}\n\n{final}"
+    st = await send_menu(update, context, final, markup, view, is_start, html=is_html)
     st["labels"] = labels
     st["mode"] = mode
+    # Create Voice লিস্ট খুললে ব্যাকগ্রাউন্ডে অকার্যকর ভয়েস খুঁজে মুছে দেয় (আধ ঘণ্টায় একবার)
+    if view.get("n") == "create" and time.time() - st.get("pruned_at", 0) > 1800:
+        st["pruned_at"] = time.time()
+        spawn(prune_dead_voices(st))
     return st
 
 
@@ -807,7 +1030,6 @@ def guarded(fn):
 PROMPT_GEN = "আপনি যে ভয়েসটি বানাতে চান সেটি এখানে লিখুন"
 PROMPT_ADDID = "আপনার Cartesia AI এর ভয়েস আইডি দিন"
 PROMPT_CLONE = "৬০ সেকেন্ডের একটি স্পষ্ট ও ক্লিন ভয়েস পাঠান"
-PROMPT_GROUP = "গ্রুপ/চ্যানেলের ID বা @username দিন\n(বটকে ওই গ্রুপ/চ্যানেলে অ্যাড থাকতে হবে)"
 PROMPT_USER = "ইউজারের ID বা @username দিন\n(ইউজারকে আগে এই বটে /start দিতে হবে)"
 
 
@@ -844,6 +1066,16 @@ async def do_generate(update, context, st, text: str):
         )
     except Exception as e:
         logging.warning("tts error: %s", e)
+        # ভয়েস Cartesia তে আর না থাকলে (404) সেটা সেভ লিস্ট থেকে অটো মুছে দেয়
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            if await voice_exists(mode["vid"]) is False:
+                n = await remove_voices(st, {mode["vid"]})
+                note = (
+                    f"🗑 ভয়েসটি আর পাওয়া যায়নি, তাই লিস্ট থেকে মুছে ফেলা হয়েছে — {mode['vname']}"
+                    if n else
+                    f"❌ ভয়েসটি পাওয়া যায়নি, অন্য ভয়েস বেছে নিন — {mode['vname']}"
+                )
+                return await goto(update, context, V("create", p=0), extra=note)
         return await prompt(
             update, context, f"{PROMPT_GEN}\n\n🎤 {mode['vname']}", mode,
             extra=f"❌ ভয়েস তৈরি হয়নি ({api_error_text(e)}). আবার লিখুন",
@@ -881,10 +1113,44 @@ async def do_add_id(update, context, st, text: str):
     await goto(update, context, V("voice"), extra=msg)
 
 
+DEAD_CHAT_HINTS = ("kicked", "not a member", "chat not found", "deactivated")
+
+
+async def retry_send(update, context, mode, extra):
+    """পাঠানো ফেইল হলে: গ্রুপ হলে আবার গ্রুপ লিস্ট, ইউজার হলে ইউজার প্রম্পট"""
+    if mode["kind"] == "group":
+        return await goto(update, context, V("pick", p=0), extra=extra, mode=mode)
+    return await prompt(update, context, PROMPT_USER, mode, extra=extra)
+
+
+async def deliver(update, context, st, chat, shown):
+    """ভয়েসটা chat এ পাঠায়। সফল হলে Create Voice এর আগের রূপে ফিরে যায়,
+    তাই আবার যেকোনো গ্রুপ/ইনবক্সে পাঠানো যায়।"""
+    mode = st["mode"]
+    kind = mode["kind"]
+    try:
+        if mode.get("k") == "audio":
+            await context.bot.send_audio(chat, audio=mode["file_id"])
+        else:
+            await context.bot.send_voice(chat, voice=mode["file_id"])
+    except TelegramError as e:
+        logging.warning("send error: %s", e)
+        low = str(e).lower()
+        if isinstance(chat, int) and chat < 0 and any(h in low for h in DEAD_CHAT_HINTS):
+            spawn(run(_mark_chat_inactive, chat))   # বট আর নেই, লিস্ট থেকে সরে যাবে
+        if kind == "group":
+            msg = "❌ পাঠানো যায়নি — বট ওই গ্রুপ/চ্যানেলে আছে কিনা ও মেসেজ পাঠানোর পারমিশন আছে কিনা দেখুন"
+        elif isinstance(e, Forbidden):
+            msg = "❌ পাঠানো যায়নি (ইউজার বটকে স্টার্ট করেনি)"
+        else:
+            msg = "❌ পাঠানো যায়নি, ID/username ঠিক আছে কিনা দেখুন"
+        return await retry_send(update, context, mode, msg)
+    await goto(update, context, V("create", p=0), extra=f"✅ ভয়েস পাঠানো হয়েছে — {shown}")
+
+
 async def do_send(update, context, st, text: str):
     mode = st["mode"]
     kind = mode["kind"]
-    ptxt = PROMPT_GROUP if kind == "group" else PROMPT_USER
     target = text.strip()
     chat = None
     if re.fullmatch(r"-?\d+", target):
@@ -896,34 +1162,49 @@ async def do_send(update, context, st, text: str):
         else:
             chat = await run(_find_uid, uname)
             if chat is None:
-                return await prompt(
-                    update, context, ptxt, mode,
-                    extra="❌ এই username এর ইউজার বটে নেই (তাকে আগে /start দিতে হবে), ID দিন",
+                return await retry_send(
+                    update, context, mode,
+                    "❌ এই username এর ইউজার বটে নেই (তাকে আগে /start দিতে হবে), ID দিন",
                 )
     if chat is None:
-        return await prompt(update, context, ptxt, mode, extra="❌ ID বা @username সঠিক নয়")
-    try:
-        if mode.get("k") == "audio":
-            await context.bot.send_audio(chat, audio=mode["file_id"])
-        else:
-            await context.bot.send_voice(chat, voice=mode["file_id"])
-    except Forbidden:
-        return await prompt(
-            update, context, ptxt, mode,
-            extra="❌ পাঠানো যায়নি (ইউজার বটকে স্টার্ট করেনি / বট গ্রুপে নেই)",
-        )
-    except TelegramError as e:
-        logging.warning("send error: %s", e)
-        return await prompt(update, context, ptxt, mode, extra="❌ পাঠানো যায়নি, ID/username ঠিক আছে কিনা দেখুন")
-    await goto(update, context, V("create", p=0), extra=f"✅ ভয়েস পাঠানো হয়েছে — {target}")
+        return await retry_send(update, context, mode, "❌ ID বা @username সঠিক নয়")
+    return await deliver(update, context, st, chat, target)
 
 
 # ---------------------------------------------------------------
 # হ্যান্ডলার
 # ---------------------------------------------------------------
+async def notify_referrer(bot, ref_uid: int, name: str):
+    try:
+        await bot.send_message(
+            ref_uid,
+            f"🎉 নতুন রেফার!\n{name} আপনার লিংক দিয়ে জয়েন করেছে\n💎 +{REFER_POINTS} পয়েন্ট যোগ হয়েছে",
+        )
+    except TelegramError:
+        pass
+
+
+async def handle_referral(update: Update, context: ContextTypes.DEFAULT_TYPE, ref_uid: int):
+    user = update.effective_user
+    try:
+        ok = await run(_process_referral, user.id, ref_uid, user.full_name, user.username)
+    except Exception as e:
+        logging.warning("referral error: %s", e)
+        return
+    if ok:
+        spawn(notify_referrer(context.bot, ref_uid, user.full_name))
+
+
 @guarded
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ref_uid = None
+    if context.args:
+        m = re.fullmatch(r"ref_(\d{1,15})", context.args[0])
+        if m:
+            ref_uid = int(m.group(1))
     async with get_lock(context, update.effective_chat.id):
+        if ref_uid:
+            await handle_referral(update, context, ref_uid)   # পয়েন্ট আগে, মেনু পরে
         await goto(update, context, MAIN1, is_start=True)
 
 
@@ -943,13 +1224,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == PREV or text == BTN_HOME:
             return await goto(update, context, MAIN1)
         if text == BTN_BACK:
+            if view.get("n") == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
+                return await goto(update, context, V("create", p=0))
             return await goto(update, context, V("allv") if view.get("n") == "vlist" else V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create"):
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
-            return await goto(update, context, nv)
+            return await goto(update, context, nv, mode=st["mode"] if view.get("n") == "pick" else None)
         if text == BUTTONS["voice"]:
             return await goto(update, context, V("voice"))
+        if text == BUTTONS["refer"]:
+            return await goto(update, context, V("refer"))
         if text == BTN_ALL:
             return await goto(update, context, V("allv"))
         if text == BTN_FEMALE:
@@ -980,6 +1265,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if t == "addid":
                 return await do_add_id(update, context, st, text)
             if t == "send":
+                # লিস্ট থেকে গ্রুপ/চ্যানেল বাছাই
+                if mode.get("kind") == "group" and view.get("n") == "pick":
+                    c = (st["labels"] or {}).get(text)
+                    if c:
+                        return await deliver(update, context, st, c["id"], c["title"])
                 return await do_send(update, context, st, text)
             if t == "clone":
                 return await prompt(update, context, PROMPT_CLONE, mode,
@@ -1003,6 +1293,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await goto(update, context, view, extra=msg)
             if n == "create":
                 return await start_gen(update, context, v)
+            if n == "pick":   # রিস্টার্টের পর ভয়েসের তথ্য হারিয়ে গেলে
+                return await goto(
+                    update, context, V("create", p=0),
+                    extra="ℹ️ ভয়েসের নিচের Send Group/Channel বাটনে আবার ক্লিক করুন",
+                )
 
         # ---------- বাকি সার্ভিস বাটন ----------
         if text in LABEL_TO_KEY:
@@ -1094,11 +1389,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with get_lock(context, chat_id):
         await get_state(context, user.id, chat_id)
-        await prompt(
-            update, context,
-            PROMPT_GROUP if kind == "group" else PROMPT_USER,
-            {"t": "send", "kind": kind, "file_id": fid, "k": k},
-        )
+        mode = {"t": "send", "kind": kind, "file_id": fid, "k": k}
+        if kind == "group":
+            await goto(update, context, V("pick", p=0), mode=mode)
+        else:
+            await prompt(update, context, PROMPT_USER, mode)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """বটকে গ্রুপ/চ্যানেলে অ্যাডমিন বানালে/সরালে রেকর্ড রাখে (কে বানিয়েছে সহ)"""
+    try:
+        u = update.my_chat_member
+        chat = u.chat
+        if chat.type not in ("group", "supergroup", "channel"):
+            return
+        is_admin = u.new_chat_member.status == "administrator"
+        data = {
+            "title": chat.title or str(chat.id),
+            "type": chat.type,
+            "username": chat.username,
+            "admin": is_admin,
+            "updated": firestore.SERVER_TIMESTAMP,
+        }
+        by = u.from_user
+        if is_admin and by and not by.is_bot:
+            data["owner_id"] = by.id
+            data["owner_name"] = by.full_name
+        await run(_save_chat, chat.id, data)
+    except Exception:
+        logging.exception("my_chat_member error")
 
 
 async def post_init(app: Application):
@@ -1144,10 +1463,14 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler(["start", "menu"], cmd_menu))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=["message", "callback_query", "my_chat_member"],
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
