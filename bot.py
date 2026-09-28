@@ -53,7 +53,7 @@ def _get_state(uid: int):
     return None, 1
 
 
-def _save_user(user, msg_id, page: int, is_start: bool):
+def _save_user(user, msg_id, page, is_start: bool):
     ref = db.collection(USERS).document(str(user.id))
     data = {
         "name": user.full_name,
@@ -106,19 +106,38 @@ TOTAL_PAGES = len(PAGES)
 NEXT = "পরের পেজ ➡️"
 PREV = "⬅️ আগের পেজ"
 
+# ---------------------------------------------------------------
+# Voice Generate সাব-মেনু পেজ (Voice Generate বাটনে ক্লিক করলে আসে)
+# ---------------------------------------------------------------
+VOICE_PAGE = "voice"
+VOICE_BUTTONS = [
+    "🎭 Cloned Voices",
+    "✨ Create Voice",
+    "🧬 Clone Voice",
+    "🆔 Add by Voice ID",
+]
+HOME = "🏠 Home"
 
-def menu_keyboard(page: int) -> ReplyKeyboardMarkup:
-    keys = PAGES[page]
+
+def menu_keyboard(page) -> ReplyKeyboardMarkup:
     rows = []
-    for i in range(0, len(keys), 2):
-        rows.append(
-            [
-                KeyboardButton(BUTTONS[k], style=COLORS.get(k, DEFAULT_STYLE))
-                for k in keys[i:i + 2]
-            ]
-        )
-    nav_label = NEXT if page < TOTAL_PAGES else PREV
-    rows.append([KeyboardButton(nav_label, style=NAV_STYLE)])
+    if page == VOICE_PAGE:
+        for i in range(0, len(VOICE_BUTTONS), 2):
+            rows.append(
+                [KeyboardButton(t, style=DEFAULT_STYLE) for t in VOICE_BUTTONS[i:i + 2]]
+            )
+        rows.append([KeyboardButton(HOME, style=NAV_STYLE)])
+    else:
+        keys = PAGES[page]
+        for i in range(0, len(keys), 2):
+            rows.append(
+                [
+                    KeyboardButton(BUTTONS[k], style=COLORS.get(k, DEFAULT_STYLE))
+                    for k in keys[i:i + 2]
+                ]
+            )
+        nav_label = NEXT if page < TOTAL_PAGES else PREV
+        rows.append([KeyboardButton(nav_label, style=NAV_STYLE)])
     return ReplyKeyboardMarkup(
         rows,
         resize_keyboard=True,
@@ -131,7 +150,9 @@ def menu_keyboard(page: int) -> ReplyKeyboardMarkup:
 PAGE_NAMES = {1: "প্রথম পেজ", 2: "দ্বিতীয় পেজ"}
 
 
-def menu_text(page: int) -> str:
+def menu_text(page) -> str:
+    if page == VOICE_PAGE:
+        return "🎙 Voice Generate\nআপনার পছন্দের অপশনটি বেছে নিন"
     return f"{PAGE_NAMES[page]}\nআপনার পছন্দের সার্ভিসটি বেছে নিন"
 
 
@@ -181,12 +202,12 @@ async def get_state(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: i
             old_id, page = await run(_get_state, user_id)
         except Exception as e:
             logging.warning("firebase read error: %s", e)
-        st = {"msg": old_id, "page": page if page in PAGES else 1}
+        st = {"msg": old_id, "page": page if (page in PAGES or page == VOICE_PAGE) else 1}
         cache[chat_id] = st
     return st["msg"], st["page"]
 
 
-async def save_bg(user, msg_id: int, page: int, is_start: bool):
+async def save_bg(user, msg_id: int, page, is_start: bool):
     try:
         await run(_save_user, user, msg_id, page, is_start)
     except Exception as e:
@@ -227,7 +248,7 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def show_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                    page: int, is_start: bool = False):
+                    page, is_start: bool = False):
     await send_menu(update, context, page, menu_text, is_start)
 
 
@@ -246,6 +267,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_page(update, context, 2)
     elif text == PREV:
         await show_page(update, context, 1)
+    elif text == HOME:
+        await show_page(update, context, 1)
+    elif text == BUTTONS["voice"]:
+        await show_page(update, context, VOICE_PAGE)
     elif text in LABEL_TO_KEY:
         await show_feature(update, context, f"{text}\n\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
     # অন্য কোনো লেখা এলে কিছু মুছবে না
