@@ -56,7 +56,9 @@ CLONE_LANG = os.environ.get("CLONE_LANG", "en")   # ক্লোন ভয়ে
 # ---------------------------------------------------------------
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# llama-3.3-70b-versatile Groq বন্ধ করে দিয়েছে (Aug 2026), তাই নতুন মডেল ডিফল্ট
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK = "openai/gpt-oss-20b"   # প্রধান মডেল ফেইল করলে এটা চেষ্টা হবে
 AI_REFINE = os.environ.get("AI_REFINE", "1") != "0"   # 0 দিলে AI বন্ধ
 
 CLONE_MIN_SEC = 30      # ক্লোনের জন্য সর্বনিম্ন ভয়েস দৈর্ঘ্য (সেকেন্ড)
@@ -308,6 +310,8 @@ async def cartesia_tts(text: str, voice_id: str) -> bytes:
         },
         timeout=90,
     )
+    if r.status_code >= 400:
+        logging.warning("cartesia tts error %s (voice %s): %s", r.status_code, voice_id, r.text[:300])
     r.raise_for_status()
     return r.content
 
@@ -327,40 +331,54 @@ REFINE_SYSTEM = (
 )
 
 
+async def _groq_call(model: str, text: str) -> str:
+    body = {
+        "model": model,
+        "temperature": 0.1,
+        "max_completion_tokens": 4096,
+        "messages": [
+            {"role": "system", "content": REFINE_SYSTEM},
+            {"role": "user", "content": f"<<<TEXT>>>\n{text}\n<<<END>>>"},
+        ],
+    }
+    if model.startswith("openai/gpt-oss"):
+        body["reasoning_effort"] = "low"   # দ্রুত রেসপন্সের জন্য
+    r = await HTTP.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        logging.warning("groq %s error %s: %s", model, r.status_code, r.text[:300])
+    r.raise_for_status()
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
 async def refine_text(text: str) -> str:
     """Groq AI দিয়ে লেখা গুছায় ও ভুল ঠিক করে। কিছু ভুল হলে আসল লেখাই ফেরত দেয়।"""
     if not (AI_REFINE and GROQ_KEY):
         return text
-    try:
-        r = await HTTP.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "temperature": 0.1,
-                "max_tokens": 4096,
-                "messages": [
-                    {"role": "system", "content": REFINE_SYSTEM},
-                    {"role": "user", "content": f"<<<TEXT>>>\n{text}\n<<<END>>>"},
-                ],
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        out = (r.json()["choices"][0]["message"]["content"] or "").strip()
-        out = out.replace("<<<TEXT>>>", "").replace("<<<END>>>", "").strip()
-        # কোড ফেন্স / বাড়তি কোটেশন থাকলে সরাও
-        if out.startswith("```"):
-            out = out.strip("`").strip()
-        n = len(text)
-        # নিরাপত্তা: খালি, অতিরিক্ত ছোট/বড় বা লিমিট পার হলে আসল লেখা ব্যবহার হবে
-        if not out or len(out) > MAX_TEXT or len(out) > n * 1.5 + 40 or len(out) < n * 0.5:
-            logging.warning("groq refine rejected (len %s -> %s)", n, len(out))
-            return text
-        return out
-    except Exception as e:
-        logging.warning("groq refine error: %s", e)
+    models = [GROQ_MODEL] + ([GROQ_FALLBACK] if GROQ_FALLBACK != GROQ_MODEL else [])
+    out = ""
+    for m in models:
+        try:
+            out = await _groq_call(m, text)
+            break
+        except Exception as e:
+            logging.warning("groq refine error (%s): %s", m, e)
+    if not out:
         return text
+    out = out.replace("<<<TEXT>>>", "").replace("<<<END>>>", "").strip()
+    # কোড ফেন্স থাকলে সরাও
+    if out.startswith("```"):
+        out = out.strip("`").strip()
+    n = len(text)
+    # নিরাপত্তা: খালি, অতিরিক্ত ছোট/বড় বা লিমিট পার হলে আসল লেখা ব্যবহার হবে
+    if not out or len(out) > MAX_TEXT or len(out) > n * 1.5 + 40 or len(out) < n * 0.5:
+        logging.warning("groq refine rejected (len %s -> %s)", n, len(out))
+        return text
+    return out
 
 
 async def to_voice(mp3: bytes):
@@ -453,6 +471,8 @@ def api_error_text(e: Exception) -> str:
             return "API কী/পারমিশন সমস্যা"
         if code in (402, 429):
             return "লিমিট শেষ, একটু পরে চেষ্টা করুন"
+        if code == 404:
+            return "ভয়েস পাওয়া যায়নি, অন্য ভয়েস বেছে নিন"
         return f"Cartesia error {code}"
     if isinstance(e, RuntimeError):
         return str(e)
