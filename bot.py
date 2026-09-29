@@ -325,6 +325,28 @@ def _lp_clear_warn(cid: int, uid: int):
     db.collection(LINK_PROT).document(str(cid)).update({f"warns.u{uid}": firestore.DELETE_FIELD})
 
 
+# ---------- Welcome Message (Firestore) ----------
+def _wl_get(cid: int):
+    snap = db.collection(WELCOME).document(str(cid)).get()
+    return (snap.to_dict() or {}) if snap.exists else None
+
+
+def _wl_save(cid: int, data: dict):
+    db.collection(WELCOME).document(str(cid)).set(data, merge=True)
+
+
+def _wl_status(ids):
+    """গ্রুপ/চ্যানেল আইডি -> ওয়েলকাম চালু আছে কিনা"""
+    out = {}
+    refs = [db.collection(WELCOME).document(str(i)) for i in ids]
+    if not refs:
+        return out
+    for snap in db.get_all(refs):
+        if snap.exists:
+            out[int(snap.id)] = bool((snap.to_dict() or {}).get("on"))
+    return out
+
+
 # ---------------------------------------------------------------
 # বাটনের রঙ (টেলিগ্রাম শুধু 3টা রঙ সাপোর্ট করে)
 #   "primary" = নীল | "success" = সবুজ | "danger" = লাল
@@ -351,11 +373,13 @@ BUTTONS = {
     "fftopup": "💎 FF Topup File",
     "refer": "🎁 Refer & Earn",
     "profile": "🙋 My Profile",
+    "welcome": "👋 Welcome Message",
+    "myorder": "📦 My Order",
 }
 LABEL_TO_KEY = {label: key for key, label in BUTTONS.items()}
 
 PAGES = {
-    1: ["smm", "voice", "tgbot", "vassist", "reply", "refer"],
+    1: ["smm", "voice", "tgbot", "vassist", "reply", "refer", "welcome", "myorder"],
     2: ["linkprot", "janai", "poll", "guard", "userinfo", "fftour", "fftopup", "profile"],
 }
 TOTAL_PAGES = len(PAGES)
@@ -448,6 +472,34 @@ LP_BAN_DEFAULT = (
 LP_WARN_TITLE = "ওয়ার্নিং নোটিশ"
 ANON_ADMIN_ID = 1087968824     # GroupAnonymousBot (অ্যানোনিমাস অ্যাডমিন)
 CHANNEL_BOT_ID = 136817688     # Channel_Bot (চ্যানেল হয়ে গ্রুপে পাঠালে)
+
+# ---------------------------------------------------------------
+# Welcome Message (গ্রুপ/চ্যানেলে নতুন কেউ জয়েন করলে ওয়েলকাম মেসেজ)
+# ---------------------------------------------------------------
+WELCOME = "welcome_msg"        # প্রতি গ্রুপ/চ্যানেলের ওয়েলকাম সেটিংস
+BTN_WL_ON = "🟢 Welcome: ON"
+BTN_WL_OFF = "🔴 Welcome: OFF"
+BTN_WL_EDIT = "✏️ Change Message"
+BTN_WL_RESET = "♻️ Reset Default"
+BTN_WL_PHOTO_ON = "🖼 Profile Photo: ON"
+BTN_WL_PHOTO_OFF = "🖼 Profile Photo: OFF"
+BTN_WL_PREVIEW = "👁 Preview"
+WL_VIEWS = ("wlc", "wl", "wlq")
+WL_TTL = 120                   # গ্রুপের সেটিংস ক্যাশ (সেকেন্ড)
+WL_MAX_LEN = 1500              # ওয়েলকাম মেসেজের সর্বোচ্চ অক্ষর
+WL_DEFAULT = (
+    "✨ 𝐀𝐬𝐬𝐚𝐥𝐚𝐦𝐮 𝐀𝐥𝐚𝐢𝐤𝐮𝐦 𝐖𝐚 𝐑𝐚𝐡𝐦𝐚𝐭𝐮𝐥𝐥𝐚𝐡𝐢 𝐖𝐚 𝐁𝐚𝐫𝐚𝐤𝐚𝐭𝐮𝐡𝐮 ✨🤲\n\n"
+    "        👑 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 🔔\n"
+    "        {name}\n\n"
+    "      😀 𝐓𝐇𝐀𝐍𝐊 𝐘𝐎𝐔 😀\n\n"
+    "      🚨 জরুরি নোটিশ 🚨\n\n"
+    "• সকলের সাথে সম্মানজনক আচরণ করুন।\n\n"
+    "• অপ্রয়োজনীয় মেসেজ, স্প্যাম ও বিজ্ঞাপন নিষিদ্ধ\n\n"
+    "• গ্রুপের শান্তিপূর্ণ পরিবেশ বজায় রাখতে সহযোগিতা করুন।\n\n"
+    "• ❌ এই গ্রুপে অন্য কোনো গ্রুপ, চ্যানেল, অথবা যেকোনো ধরনের লিংক পোস্ট করা কঠোরভাবে নিষিদ্ধ।\n"
+    "• ⚠️ কেউ এই নিয়ম ভঙ্গ করলে প্রশাসনের সিদ্ধান্ত অনুযায়ী Mute অথবা Ban করা হবে।\n\n"
+    "🤲 আল্লাহ তাআলা আমাদের সবাইকে সঠিক পথে চলার তাওফীক দান করুন। আমীন।🌿"
+)
 
 # ---------------------------------------------------------------
 # অ্যাডমিন প্যানেল (/APDADMIN) — শুধু ADMIN_ID এর ইউজার ব্যবহার করতে পারবে
@@ -1297,6 +1349,104 @@ async def render_lp(view, st):
     raise RuntimeError("অজানা মেনু")
 
 
+async def render_wl(view, st):
+    n = view.get("n")
+    labels = {}
+    nav = [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]
+    if st is None:
+        raise RuntimeError("state নেই")
+
+    if n == "wlc":
+        try:
+            owned = await run(_get_owned_chats, st["uid"])
+        except Exception as e:
+            logging.warning("wl owned chats error: %s", e)
+            owned = []
+        try:
+            status = await run(_wl_status, [c["id"] for c in owned])
+        except Exception as e:
+            logging.warning("wl status error: %s", e)
+            status = {}
+        pages = max(1, math.ceil(len(owned) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for c in owned[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            on_ = status.get(c["id"], False)
+            pre = "🟢" if on_ else ("📢" if c["type"] == "channel" else "👥")
+            label = uniq_label(pre, c["title"], labels)
+            labels[label] = c
+            btns.append(B(label, "success" if on_ else DEFAULT_STYLE))
+        rows = pair(btns)
+        pn = page_nav(pg, pages)
+        if pn:
+            rows.append(pn)
+        rows.append(nav)
+        text = (
+            "👋 Welcome Message\n"
+            "যে গ্রুপ/চ্যানেলে ওয়েলকাম মেসেজ চালাতে চান সেটি বেছে নিন\n"
+            "অথবা গ্রুপ/চ্যানেলের ID বা @username লিখুন\n"
+            "🟢 = ওয়েলকাম চালু আছে"
+        )
+        if not owned:
+            text += "\n\n(কোনো গ্রুপ/চ্যানেল পাওয়া যায়নি — বটকে অ্যাডমিন বানান, অথবা ID লিখুন)"
+        elif pages > 1:
+            text += f"\n({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("wlc", p=pg)
+
+    cid = view.get("c")
+    cfg = await run(_wl_get, cid)
+    if cfg is None:
+        raise RuntimeError("গ্রুপ/চ্যানেল পাওয়া যায়নি")
+    title = cfg.get("title") or str(cid)
+    on = bool(cfg.get("on"))
+    photo = cfg.get("photo", True) is not False
+    custom = bool(cfg.get("text"))
+    tpl = cfg.get("text") or WL_DEFAULT
+
+    if n == "wl":
+        text = (
+            f"👋 Welcome Message — {title}\n"
+            f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n"
+            f"🖼 জয়েন করা ইউজারের ছবি: {'✅ দেখাবে' if photo else '🚫 দেখাবে না'}\n"
+            f"📝 মেসেজ: {'✏️ কাস্টম' if custom else '📌 ডিফল্ট'}\n\n"
+            "কেউ জয়েন করলে এই মেসেজটা যাবে ({name} এর জায়গায় তার নাম বসবে, ক্লিক করলে প্রোফাইলে নিবে):\n\n"
+            f"{tpl}\n\n"
+            "{name} = জয়েন করা ইউজারের নাম (ক্লিকযোগ্য)\n"
+            "{username} = ইউজারনেম\n"
+            "{id} = TG ID\n"
+            "{group} = গ্রুপ/চ্যানেলের নাম\n\n"
+            "ℹ️ বটকে এখানে অ্যাডমিন রাখতে হবে, নাহলে কে জয়েন করলো বট জানতে পারবে না।"
+        )
+        if cfg.get("type") == "channel":
+            text += "\nচ্যানেলে বটকে Post Messages পারমিশনও দিতে হবে।"
+        rows = [
+            [B(BTN_WL_ON if on else BTN_WL_OFF, "success" if on else "danger")],
+            [B(BTN_WL_EDIT), B(BTN_WL_RESET)],
+            [B(BTN_WL_PHOTO_ON if photo else BTN_WL_PHOTO_OFF, "success" if photo else "danger"),
+             B(BTN_WL_PREVIEW)],
+            nav,
+        ]
+        return text, kb(rows), labels, V("wl", c=cid)
+
+    if n == "wlq":
+        s_ = view.get("s")
+        if s_ != "txt":
+            raise RuntimeError("অজানা ধাপ")
+        text = (
+            "✏️ নতুন ওয়েলকাম মেসেজ লিখুন (সর্বোচ্চ ১৫০০ অক্ষর)\n\n"
+            "এগুলো ব্যবহার করতে পারবেন:\n"
+            "{name} = জয়েন করা ইউজারের নাম\n"
+            "{username} = ইউজারনেম\n"
+            "{id} = TG ID\n"
+            "{group} = গ্রুপ/চ্যানেলের নাম\n\n"
+            "{name} না লিখলে সবার উপরে জয়েন করা ইউজারের নাম নিজে থেকেই বসবে।\n\n"
+            f"এখনকার মেসেজ:\n{tpl}"
+        )
+        return text, kb([nav]), labels, V("wlq", s=s_, c=cid)
+
+    raise RuntimeError("অজানা মেনু")
+
+
 # ---------------------------------------------------------------
 # মেনু রেন্ডার: (টেক্সট, কীবোর্ড, লেবেল→ভয়েস, ঠিক করা ভিউ)
 # ---------------------------------------------------------------
@@ -1306,6 +1456,9 @@ async def render(view, st=None, ctx=None):
 
     if n in LP_VIEWS:
         return await render_lp(view, st)
+
+    if n in WL_VIEWS:
+        return await render_wl(view, st)
 
     if n == "refer":
         text = await refer_text(ctx) if ctx else ""
@@ -1780,7 +1933,7 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
     chat_id = update.effective_chat.id
     user = update.effective_user
     st = context.bot_data.setdefault("state", {}).get(chat_id)
-    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS + LP_VIEWS:
+    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS + LP_VIEWS + WL_VIEWS:
         st = await get_state(context, user.id, chat_id)
     try:
         rtext, markup, labels, view = await render(
@@ -1794,6 +1947,8 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
             fb, err = V("ar"), "❌ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("n") in LP_VIEWS:
             fb, err = V("main", p=2), "❌ লোড হয়নি, আবার চেষ্টা করুন"
+        elif view.get("n") in WL_VIEWS:
+            fb, err = MAIN1, "❌ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("ar"):   # Auto Reply এর Browse All Voices লোড না হলে
             fb, err = V("ar"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         else:
@@ -3439,6 +3594,268 @@ async def on_link_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Welcome Message — মেনু, সেটিংস ও জয়েন হলে ওয়েলকাম পাঠানো
+# ---------------------------------------------------------------
+_WL_CACHE = {}
+_wl_recent = {}   # (chat, user) -> শেষ যে সময়ে ওয়েলকাম গেছে (একই জয়েনে দুইবার না যাওয়ার জন্য)
+
+
+def wl_invalidate(cid=None):
+    if cid is None:
+        _WL_CACHE.clear()
+    else:
+        _WL_CACHE.pop(cid, None)
+
+
+async def wl_cfg(cid: int):
+    hit = _WL_CACHE.get(cid)
+    if hit and time.time() - hit[0] < WL_TTL:
+        return hit[1]
+    cfg = await run(_wl_get, cid)
+    if len(_WL_CACHE) > 3000:
+        _WL_CACHE.clear()
+    _WL_CACHE[cid] = (time.time(), cfg)
+    return cfg
+
+
+async def wl_save(cid: int, data: dict):
+    await run(_wl_save, cid, data)
+    wl_invalidate(cid)
+
+
+async def wl_perm_note(bot, cid, ctype) -> str:
+    """বটের দরকারি পারমিশন না থাকলে সতর্কবার্তা"""
+    try:
+        bm = await bot.get_chat_member(cid, bot.id)
+    except TelegramError:
+        return "⚠️ বটের পারমিশন যাচাই করা যায়নি"
+    if bm.status != "administrator":
+        return "⚠️ বট এখানে অ্যাডমিন নয় — আগে বটকে অ্যাডমিন বানান"
+    if ctype == "channel" and not getattr(bm, "can_post_messages", False):
+        return "⚠️ বটকে Post Messages পারমিশন দিন"
+    return ""
+
+
+def wl_build(cfg, fu, title) -> str:
+    """ওয়েলকাম মেসেজের HTML। {name} = ক্লিকযোগ্য নাম (প্রোফাইলে নিয়ে যায়)।
+    কাস্টম মেসেজে {name} না থাকলে সবার উপরে জয়েন করা ইউজারের নাম বসে।"""
+    mention, uname = lp_user_bits(fu)
+    tpl = cfg.get("text") or WL_DEFAULT
+    body = (
+        h_esc(tpl)
+        .replace("{name}", mention)
+        .replace("{username}", uname)
+        .replace("{id}", f"<code>{fu.id}</code>")
+        .replace("{group}", f"<b>{h_esc(title or '')}</b>")
+    )
+    if "{name}" in tpl:
+        return body
+    return f"👤 {mention} ({uname})\n\n" + body
+
+
+def _plain_len(html: str) -> int:
+    t = re.sub(r"<[^>]+>", "", html)
+    t = t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return len(t.encode("utf-16-le")) // 2   # টেলিগ্রাম UTF-16 হিসেবে গোনে
+
+
+async def wl_send(bot, chat_id: int, uid: int, html: str, photo: bool = True):
+    """প্রোফাইল ছবিসহ ওয়েলকাম পাঠায়। মেসেজ ক্যাপশনে না ধরলে ছবি আলাদা, লেখা তার নিচে"""
+    fid = None
+    if photo:
+        try:
+            ph = await bot.get_user_profile_photos(uid, limit=1)
+            if ph.total_count and ph.photos:
+                fid = ph.photos[0][-1].file_id
+        except TelegramError as e:
+            logging.info("wl profile photo error: %s", e)
+    try:
+        if fid and _plain_len(html) <= 1000:
+            await bot.send_photo(chat_id, fid, caption=html, parse_mode="HTML")
+            return
+        if fid:
+            await bot.send_photo(chat_id, fid)
+    except TelegramError as e:
+        logging.info("wl photo error: %s", e)
+    try:
+        await bot.send_message(chat_id, html, parse_mode="HTML",
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except TelegramError as e:
+        logging.warning("welcome send error (%s): %s", chat_id, e)
+
+
+async def wl_open(update, context, cid, title, ctype):
+    """বাছাই করা গ্রুপ/চ্যানেলের Welcome মেনু খোলে (আগে যাচাই: ইউজার অ্যাডমিন কিনা)"""
+    user = update.effective_user
+    back = V("wlc", p=0)
+    try:
+        m = await context.bot.get_chat_member(cid, user.id)
+    except TelegramError as e:
+        logging.warning("wl open member error: %s", e)
+        return await goto(update, context, back,
+                          extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+    if m.status not in ("creator", "administrator"):
+        return await goto(update, context, back, extra="❌ আপনি ওই গ্রুপ/চ্যানেলের অ্যাডমিন নন")
+    try:
+        await wl_save(cid, {"title": title, "type": ctype, "owner_id": user.id})
+    except Exception as e:
+        logging.warning("wl save error: %s", e)
+        return await goto(update, context, back, extra="❌ সেভ হয়নি, আবার চেষ্টা করুন")
+    note = await wl_perm_note(context.bot, cid, ctype)
+    return await goto(update, context, V("wl", c=cid), extra=note or None)
+
+
+async def wl_back(update, context, view):
+    n, c = view.get("n"), view.get("c")
+    if n == "wlc":
+        return await goto(update, context, MAIN1)
+    if n == "wl":
+        return await goto(update, context, V("wlc", p=0))
+    return await goto(update, context, V("wl", c=c))   # wlq
+
+
+async def wl_text(update, context, st, view, text: str) -> bool:
+    """Welcome মেনুর সব বাটন ও লেখা। এই মেনুগুলোতে থাকলে সবসময় True"""
+    n = view.get("n")
+    cid = view.get("c")
+    user = update.effective_user
+
+    def go(v, **kw):
+        return goto(update, context, v, **kw)
+
+    # ---------- গ্রুপ/চ্যানেল বাছাই ----------
+    if n == "wlc":
+        lb = st["labels"]
+        if lb is None:
+            try:
+                _, _, lb, _ = await render(view, st)
+            except Exception as e:
+                logging.warning("wl labels rebuild error: %s", e)
+                lb = {}
+            st["labels"] = lb
+        c = lb.get(text)
+        if c:
+            await wl_open(update, context, c["id"], c["title"], c["type"])
+            return True
+        target = text.strip()
+        if re.fullmatch(r"-?\d+", target):
+            ref = int(target)
+        elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", target):
+            ref = "@" + target.lstrip("@")
+        else:
+            await go(V("wlc", p=view.get("p", 0)), extra="❌ ID বা @username সঠিক নয়")
+            return True
+        try:
+            ch = await context.bot.get_chat(ref)
+        except TelegramError as e:
+            logging.warning("wl chat lookup error: %s", e)
+            await go(V("wlc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+            return True
+        if ch.type not in ("group", "supergroup", "channel"):
+            await go(V("wlc", p=0), extra="❌ এটা গ্রুপ/চ্যানেল নয়")
+            return True
+        await wl_open(update, context, ch.id, ch.title or str(ch.id), ch.type)
+        return True
+
+    cfg = await run(_wl_get, cid)
+    if cfg is None:
+        await go(V("wlc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি")
+        return True
+
+    # ---------- মেইন Welcome মেনু ----------
+    if n == "wl":
+        if text in (BTN_WL_ON, BTN_WL_OFF):
+            now_on = not cfg.get("on")
+            await wl_save(cid, {"on": now_on})
+            msg = "🟢 Welcome Message চালু হয়েছে" if now_on else "🔴 Welcome Message বন্ধ হয়েছে"
+            if now_on:
+                note = await wl_perm_note(context.bot, cid, cfg.get("type"))
+                if note:
+                    msg += "\n" + note
+            await go(V("wl", c=cid), extra=msg)
+        elif text == BTN_WL_EDIT:
+            await go(V("wlq", s="txt", c=cid))
+        elif text == BTN_WL_RESET:
+            await wl_save(cid, {"text": None})
+            await go(V("wl", c=cid), extra="♻️ ডিফল্ট মেসেজ ফিরিয়ে আনা হয়েছে")
+        elif text in (BTN_WL_PHOTO_ON, BTN_WL_PHOTO_OFF):
+            new = cfg.get("photo", True) is False
+            await wl_save(cid, {"photo": new})
+            await go(V("wl", c=cid),
+                     extra="🖼 জয়েন করা ইউজারের ছবি দেখাবে" if new else "🖼 জয়েন করা ইউজারের ছবি দেখাবে না")
+        elif text == BTN_WL_PREVIEW:
+            await go(V("wl", c=cid), extra="👁 নিচে প্রিভিউ দেখুন — নতুন কেউ জয়েন করলে এভাবেই যাবে")
+            await wl_send(context.bot, user.id, user.id,
+                          wl_build(cfg, user, cfg.get("title")),
+                          photo=cfg.get("photo", True) is not False)
+        return True
+
+    # ---------- মেসেজ লেখা ----------
+    if n == "wlq" and view.get("s") == "txt":
+        t = text.strip()
+        if not t or len(t) > WL_MAX_LEN:
+            await go(V("wlq", s="txt", c=cid), extra=f"❌ মেসেজ ১ থেকে {WL_MAX_LEN} অক্ষরের মধ্যে হতে হবে")
+            return True
+        await wl_save(cid, {"text": t})
+        await go(V("wl", c=cid), extra="✅ ওয়েলকাম মেসেজ বদলানো হয়েছে")
+        return True
+    return True
+
+
+async def wl_welcome(bot, chat, fu):
+    """কেউ জয়েন করলে (ON থাকলে) ওয়েলকাম পোস্ট করে"""
+    if fu is None or fu.is_bot:
+        return
+    key = (chat.id, fu.id)
+    now = time.time()
+    if now - _wl_recent.get(key, 0) < 30:   # একই জয়েনের দুইটা আপডেটে একবারই যাবে
+        return
+    _wl_recent[key] = now
+    if len(_wl_recent) > 5000:
+        _wl_recent.clear()
+    cfg = await wl_cfg(chat.id)
+    if not cfg or not cfg.get("on"):
+        return
+    # বট OFF/UPDATE মোডে শুধু অ্যাডমিনের নিজের সেট করা ওয়েলকাম চলবে
+    if _BS["state"] != "on" and cfg.get("owner_id") not in ADMIN_IDS:
+        return
+    await wl_send(bot, chat.id, fu.id, wl_build(cfg, fu, chat.title),
+                  photo=cfg.get("photo", True) is not False)
+
+
+def _wl_is_member(m) -> bool:
+    return m.status in ("member", "administrator", "creator") or (
+        m.status == "restricted" and bool(getattr(m, "is_member", False))
+    )
+
+
+async def on_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপ/চ্যানেলে নতুন সদস্য জয়েন করলে (chat_member আপডেট — বট অ্যাডমিন থাকলে আসে)"""
+    try:
+        u = update.chat_member
+        if u is None or u.chat.type not in ("group", "supergroup", "channel"):
+            return
+        if _wl_is_member(u.old_chat_member) or not _wl_is_member(u.new_chat_member):
+            return
+        await wl_welcome(context.bot, u.chat, u.new_chat_member.user)
+    except Exception:
+        logging.exception("on_member_join error")
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপে 'জয়েন করেছে' সার্ভিস মেসেজ এলে (বাড়তি নিরাপত্তা, ডুপ্লিকেট আটকানো আছে)"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or chat.type not in ("group", "supergroup"):
+            return
+        for u in msg.new_chat_members or ():
+            await wl_welcome(context.bot, chat, u)
+    except Exception:
+        logging.exception("on_new_members error")
+
+
 async def notify_referrer(bot, ref_uid: int, name: str):
     try:
         await bot.send_message(
@@ -3508,6 +3925,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await adm_back(update, context, st, view)
             if vn_ in LP_VIEWS:
                 return await lp_back(update, context, view)
+            if vn_ in WL_VIEWS:
+                return await wl_back(update, context, view)
             if vn_ == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
                 return await goto(update, context, V("create", p=0))
             if vn_ == "ar":
@@ -3528,7 +3947,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if vn_ == "vlist":
                 return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
             return await goto(update, context, V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats", "lpc", "lpa"):
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats", "lpc", "lpa", "wlc"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
             return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
@@ -3539,6 +3958,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if view.get("n") in LP_VIEWS:   # Link Protect মেনু
             await lp_text(update, context, st, view, text)
             return
+        if view.get("n") in WL_VIEWS:   # Welcome Message মেনু
+            await wl_text(update, context, st, view, text)
+            return
+        if text == BUTTONS["welcome"]:
+            return await goto(update, context, V("wlc", p=0))
         if text == BUTTONS["linkprot"]:
             return await goto(update, context, V("lpc", p=0))
         if text == BUTTONS["voice"]:
@@ -3909,6 +4333,9 @@ def main():
         filters=filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.User(user_id=list(ADMIN_IDS)),
     ))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    # Welcome Message: নতুন সদস্য জয়েন করলে
+    app.add_handler(ChatMemberHandler(on_member_join, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
     app.add_handler(CallbackQueryHandler(on_cd, pattern="^cd$"))
     app.add_handler(CallbackQueryHandler(on_pv_end, pattern="^pv_end$"))
@@ -3921,7 +4348,7 @@ def main():
         & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
     app.run_polling(
         allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post",
-                         "callback_query", "my_chat_member"],
+                         "callback_query", "my_chat_member", "chat_member"],
         drop_pending_updates=True,
     )
 
