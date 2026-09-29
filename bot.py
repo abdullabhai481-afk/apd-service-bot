@@ -347,13 +347,19 @@ BTN_AR_BROWSE = "🎭 Browse All Voices"     # Generate Voice: সব ভয়�
 BTN_AR_REROLL = "🔄 Another Random Voice"  # র‍্যান্ডম বেছে নেওয়ার পর নতুন র‍্যান্ডম ভয়েস
 BTN_AR_ON = "🟢 Auto Reply: ON"
 BTN_AR_OFF = "🔴 Auto Reply: OFF"
+BTN_AR_MATCH_EXACT = "🎯 Match: Exact"        # হুবহু এক হলে রিপ্লাই
+BTN_AR_MATCH_CONTAINS = "🔍 Match: Contains"  # মেসেজের ভেতরে থাকলেই রিপ্লাই
 BTN_AR_ADD = "➕ Add Texts"
 BTN_AR_REPL = "🔁 Replace Texts"
 BTN_AR_CHATS = "👥 Group/Channel"
 BTN_AR_DEL = "🗑 Delete Voice"
 BTN_DEL_YES = "✅ Yes, Delete"
 BTN_DEL_NO = "❌ Cancel"
-AVSET_BTNS = (BTN_AR_ON, BTN_AR_OFF, BTN_AR_ADD, BTN_AR_REPL, BTN_AR_CHATS, BTN_AR_DEL)
+AVSET_BTNS = (
+    BTN_AR_ON, BTN_AR_OFF, BTN_AR_MATCH_EXACT, BTN_AR_MATCH_CONTAINS,
+    BTN_AR_ADD, BTN_AR_REPL, BTN_AR_CHATS, BTN_AR_DEL,
+)
+AR_CONTAINS_MIN = 2     # "Contains" মোডে এর চেয়ে ছোট (অক্ষর) টেক্সট মেলানো হবে না
 AR_VIEWS = ("ar", "argen", "arset", "avset", "avchats", "avdel", "arprompt")
 AR_MAX_TRIG = 200       # এক ভয়েসে সর্বোচ্চ কয়টা টেক্সট
 AR_COOLDOWN = 3         # একই গ্রুপে একই ভয়েস কমপক্ষে কত সেকেন্ড পর পর যাবে
@@ -1001,14 +1007,17 @@ async def render(view, st=None, ctx=None):
         shown = ", ".join(trig[:15]) + (f" … (+{len(trig) - 15})" if len(trig) > 15 else "")
         meta = it.get("chat_meta") or {}
         chats = ", ".join(meta.get(str(c)) or str(c) for c in (it.get("chat_ids") or []))
+        contains = it.get("match") == "contains"
         text = (
             f"🎙 {it['name']}\n"
-            f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n\n"
+            f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n"
+            f"মেলানো: {'🔍 Contains (মেসেজের ভেতরে থাকলেই)' if contains else '🎯 Exact (হুবহু এক হলে)'}\n\n"
             f"📝 টেক্সট ({len(trig)}): {shown or 'সেট করা হয়নি'}\n"
             f"👥 গ্রুপ/চ্যানেল: {chats or 'সেট করা হয়নি'}"
         )
         rows = [
             [B(BTN_AR_ON if on else BTN_AR_OFF, "success" if on else "danger")],
+            [B(BTN_AR_MATCH_CONTAINS if contains else BTN_AR_MATCH_EXACT)],
             [B(BTN_AR_ADD), B(BTN_AR_REPL)],
             [B(BTN_AR_CHATS), B(BTN_AR_DEL)],
             [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)],
@@ -1527,7 +1536,8 @@ def trig_prompt(name: str, kind: str) -> str:
     return (
         f"{head}\n\nউদাহরণ: কি করো, কেমন আছো, খাইছো\n"
         "(কমা দিয়ে আলাদা করে সব একসাথে লিখুন। এগুলোর যেকোনো একটা লিখলেই ভয়েস যাবে। "
-        "গ্রুপে হুবহু এই টেক্সটই লিখতে হবে, শুধু স্পেস কম-বেশি হলে সমস্যা নেই)\n\n"
+        "Exact মোডে হুবহু এই টেক্সটই লিখতে হবে (স্পেস কম-বেশি হলে সমস্যা নেই)। "
+        "চাইলে ভয়েসের সেটিংসে Match: Contains করলে মেসেজের ভেতরে থাকলেই যাবে)\n\n"
         f"🎙 {name}"
     )
 
@@ -1643,7 +1653,7 @@ async def do_ar_generate(update, context, st, text: str):
     data = {
         "owner_id": st["uid"], "name": mode["aname"], "cvid": mode["cvid"],
         "file_id": fid, "k": k, "triggers": [], "keys": [],
-        "chat_ids": [], "chat_meta": {}, "on": True, "ts": time.time(),
+        "chat_ids": [], "chat_meta": {}, "on": True, "match": "exact", "ts": time.time(),
     }
     try:
         await run(_ar_create, data)
@@ -1767,6 +1777,16 @@ async def avset_action(update, context, st, view, text: str):
         ar_invalidate()
         return await goto(update, context, back,
                           extra="🟢 Auto Reply চালু হয়েছে" if now_on else "🔴 Auto Reply বন্ধ হয়েছে")
+    if text in (BTN_AR_MATCH_EXACT, BTN_AR_MATCH_CONTAINS):
+        new = "exact" if it.get("match") == "contains" else "contains"
+        await run(_ar_update, i, {"match": new})
+        ar_invalidate()
+        note = (
+            "🔍 Contains চালু — মেসেজের যেকোনো জায়গায় টেক্সটটা থাকলেই ভয়েস যাবে"
+            if new == "contains" else
+            "🎯 Exact চালু — শুধু হুবহু এক টেক্সট হলে ভয়েস যাবে"
+        )
+        return await goto(update, context, back, extra=note)
     if text == BTN_AR_ADD:
         return await ar_prompt(update, context, trig_prompt(it["name"], "add"),
                                {"t": "ar_trig", "i": i, "kind": "add", "back": back})
@@ -2089,7 +2109,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """গ্রুপ/চ্যানেলে কেউ সেট করা টেক্সট লিখলে (স্পেস বাদে হুবহু এক) সেই ভয়েস পাঠায়"""
+    """গ্রুপ/চ্যানেলে সেট করা টেক্সট মিললে সেই ভয়েস পাঠায় (Exact = হুবহু এক | Contains = মেসেজের ভেতরে থাকলেই)"""
     try:
         msg = update.effective_message
         chat = update.effective_chat
@@ -2103,9 +2123,21 @@ async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         rules = await ar_rules_for(chat.id)
         now = time.time()
+        # ১) আগে Exact মিল (হুবহু), ২) না পেলে Contains মিল (সবচেয়ে লম্বা মিলটা জেতে)
+        hit = None
         for r in rules:
-            if not r.get("on", True) or key not in (r.get("keys") or ()):
-                continue
+            if r.get("on", True) and key in (r.get("keys") or ()):
+                hit = r
+                break
+        if hit is None:
+            best = 0
+            for r in rules:
+                if not r.get("on", True) or r.get("match") != "contains":
+                    continue
+                for k in (r.get("keys") or ()):
+                    if len(k) >= AR_CONTAINS_MIN and len(k) > best and k in key:
+                        best, hit = len(k), r
+        for r in ([hit] if hit else []):
             ck = (chat.id, r["id"])
             if now - _ar_last.get(ck, 0) < AR_COOLDOWN:
                 return
