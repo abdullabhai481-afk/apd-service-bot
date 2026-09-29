@@ -25,13 +25,15 @@ from telegram import (
     LinkPreviewOptions,
     MenuButtonDefault,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     ReplyParameters,
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
@@ -94,6 +96,7 @@ USERS = "users"
 USER_VOICES = "user_voices"   # প্রতি ইউজারের সেভ করা ভয়েস লিস্ট (চিরস্থায়ী)
 AUTO_VOICES = "auto_voices"   # অটো রিপ্লাই ভয়েস (টেক্সট + গ্রুপ/চ্যানেল সহ)
 BOT_CHATS = "bot_chats"       # যেসব গ্রুপ/চ্যানেলে বট অ্যাডমিন (কে অ্যাডমিন বানিয়েছে সহ)
+BOT_SETTINGS = "bot_settings"  # বট ON/OFF/UPDATE অবস্থা + কাউন্টডাউন মেসেজ লিস্ট (রিস্টার্টেও থাকবে)
 REFER_POINTS = int(os.environ.get("REFER_POINTS", 1))   # প্রতি সফল রেফারে কত পয়েন্ট
 
 
@@ -388,6 +391,30 @@ BTN_AD_BAN = "🚫 Ban/Block"
 BTN_AD_CAT = "🗂 Category Manage"
 BTN_AD_SET = "⚙️ Bot Settings"
 BTN_AD_UPDATE = "🛠 Bot Update Mode"
+# --- বট পাওয়ার বাটন (অ্যাডমিন প্যানেলের একদম ওপরে) ---
+BTN_PW_ON = "🟢 Bot: ON"
+BTN_PW_OFF = "🔴 Bot: OFF"
+BTN_PW_UPD = "🛠 Bot: UPDATE"
+POWER_BTNS = (BTN_PW_ON, BTN_PW_OFF, BTN_PW_UPD)
+# --- Bot Update Mode মেনু ---
+BTN_UPD_MANUAL = "🎛 Manual Update"          # ইচ্ছেমতো আপডেট মোড চালু/বন্ধ (নিজে না সরানো পর্যন্ত চলবে)
+BTN_UPD_TIMER = "⏱ Timer Update"            # সময় সেট করলে সময় শেষে অটো চালু
+BTN_UPD_LIVE = "✅ Update শেষ · সব চালু"     # আপডেট মোড সরিয়ে সব কার্যক্রম চালু
+# --- Notice মেনু ---
+BTN_NT_USER = "👤 নির্দিষ্ট ইউজার"
+BTN_NT_ALL = "👥 সকল ইউজার (All)"
+# --- পোস্ট/নোটিশ তৈরির ধাপ ---
+BTN_CMP_NOIMG = "📝 ছবি ছাড়া"
+BTN_CMP_IMG = "🖼 ছবি সহ"
+BTN_CMP_POST = "✅ Post"
+BTN_CMP_SEND = "✅ Send Notice"
+BTN_CMP_CANCEL = "❌ Cancel"
+ADM_VIEWS = ("admin", "upd", "notice", "cmp")
+BCAST_RATE = int(os.environ.get("BCAST_RATE", 25))     # টেলিগ্রাম লিমিটের নিচে থাকতে প্রতি সেকেন্ডে সর্বোচ্চ কতটা মেসেজ/এডিট
+NOTICE_INLINE_MAX = 60   # এর বেশি ইউজারকে নোটিশ গেলে ব্যাকগ্রাউন্ডে যাবে
+UPD_MIN_SEC = 10
+UPD_MAX_SEC = 7 * 86400
+
 ADMIN_BTNS = (
     BTN_AD_USERS, BTN_AD_REFER, BTN_AD_BTNS, BTN_AD_ADD, BTN_AD_CHECK, BTN_AD_NOTICE,
     BTN_AD_CHAT, BTN_AD_BAN, BTN_AD_CAT, BTN_AD_SET, BTN_AD_UPDATE,
@@ -960,6 +987,7 @@ async def render(view, st=None, ctx=None):
         if not ctx or not is_admin(ctx["user"].id):
             return menu_text(1), main_keyboard(1), labels, MAIN1
         rows = [
+            [B(power_label(), power_style())],
             [B(BTN_AD_USERS), B(BTN_AD_REFER)],
             [B(BTN_AD_BTNS), B(BTN_AD_ADD, "success")],
             [B(BTN_AD_CHECK)],
@@ -968,7 +996,55 @@ async def render(view, st=None, ctx=None):
             [B(BTN_AD_SET), B(BTN_AD_UPDATE)],
             [B(BTN_HOME, NAV_STYLE)],
         ]
-        return "🛡 ADMIN PANEL\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V("admin")
+        text = f"🛡 ADMIN PANEL\n{status_line()}\nআপনার পছন্দের অপশনটি বেছে নিন"
+        return text, kb(rows), labels, V("admin")
+
+    if n in ("upd", "notice", "cmp"):
+        # নিরাপত্তা: অ্যাডমিন ছাড়া কেউ এই মেনু দেখতে পাবে না
+        if not ctx or not is_admin(ctx["user"].id):
+            return menu_text(1), main_keyboard(1), labels, MAIN1
+        if n == "upd":
+            rows = []
+            if _BS["state"] == "update":
+                rows.append([B(BTN_UPD_LIVE, "success")])
+            rows += [[B(BTN_UPD_MANUAL)], [B(BTN_UPD_TIMER)], [B(BTN_HOME, NAV_STYLE)]]
+            text = (
+                "🛠 Bot Update Mode\n"
+                f"{status_line()}\n\n"
+                "🎛 Manual Update — নিজে বন্ধ না করা পর্যন্ত আপডেট মোড চলবে\n"
+                "⏱ Timer Update — সময় শেষে বট অটো চালু হবে"
+            )
+            return text, kb(rows), labels, V("upd")
+        if n == "notice":
+            rows = [[B(BTN_NT_USER), B(BTN_NT_ALL)], [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
+            return "📢 Notice\nকাকে নোটিশ পাঠাবেন?", kb(rows), labels, V("notice")
+        # n == "cmp": পোস্ট/নোটিশ তৈরির ধাপ
+        s_, k_ = view.get("s", "img"), view.get("k", "um")
+        head = CMP_TITLES.get(k_, "📢")
+        nav = [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]
+        if s_ == "time":
+            text = (f"{head}\n⏱ কত সময় পর বট আবার চালু হবে?\n\n"
+                    "যেমন: 30m, 2h, 1h30m, 45s, ১ঘন্টা ৩০মিনিট\n(কমপক্ষে 10 সেকেন্ড, সর্বোচ্চ 7 দিন)")
+            rows = [nav]
+        elif s_ == "target":
+            text = f"{head}\nইউজারের ID বা @username দিন\n(ইউজারকে আগে এই বটে /start দিতে হবে)"
+            rows = [nav]
+        elif s_ == "img":
+            text = f"{head}\nছবি ছাড়া নাকি ছবি সহ পোস্ট করবেন?"
+            rows = [[B(BTN_CMP_NOIMG), B(BTN_CMP_IMG)], nav]
+        elif s_ == "photo":
+            text = f"{head}\n🖼 ছবি পাঠান"
+            rows = [nav]
+        elif s_ == "text":
+            text = f"{head}\n✍️ টেক্সট লিখুন"
+            rows = [nav]
+        else:
+            s_ = "ready"
+            is_nt = k_ in ("na", "nu")
+            text = f"{head}\n👆 উপরের প্রিভিউ দেখে নিন। ঠিক থাকলে {'Send' if is_nt else 'Post'} চাপুন"
+            rows = [[B(BTN_CMP_SEND if is_nt else BTN_CMP_POST, "success")],
+                    [B(BTN_CMP_CANCEL, "danger")], nav]
+        return text, kb(rows), labels, V("cmp", s=s_, k=k_)
 
     if n == "ar":
         rows = [
@@ -1570,6 +1646,650 @@ async def do_send(update, context, st, text: str):
 
 
 # ---------------------------------------------------------------
+# বট ON / OFF / UPDATE মোড + ব্রডকাস্ট (Post / Notice) — শুধু অ্যাডমিনের জন্য
+#   state: "on"     = সব চালু
+#          "off"    = ইউজাররা কোনো মেনু পাবে না, তাদের সব মেসেজ মুছে যাবে
+#          "update" = আপডেট মোড: ইউজারদের সব মেসেজ মুছে যাবে, শুধু অ্যাডমিন বট চালাতে পারবে
+#   অ্যাডমিন (ADMIN_ID) কোনো অবস্থাতেই আটকায় না।
+# ---------------------------------------------------------------
+CMP_TITLES = {
+    "um": "🎛 Manual Update Post",
+    "ut": "⏱ Timer Update Post",
+    "na": "📢 Notice → সকল ইউজার",
+    "nu": "📢 Notice → নির্দিষ্ট ইউজার",
+}
+_BS = {"state": "on", "until": 0.0, "cd": None, "tok": 0, "editing": False}
+_BS_LOCK = None   # post_init এ তৈরি হয়
+_BN = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
+_EN = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+
+def bn(n, w=2) -> str:
+    return str(int(n)).zfill(w).translate(_BN)
+
+
+def fmt_left(rem: float) -> str:
+    rem = max(0, int(rem))
+    d, r = divmod(rem, 86400)
+    h, r = divmod(r, 3600)
+    m, s = divmod(r, 60)
+    parts = []
+    if d:
+        parts.append(f"{bn(d, 1)} দিন")
+    if h:
+        parts.append(f"{bn(h, 1)} ঘন্টা")
+    if m:
+        parts.append(f"{bn(m, 1)} মিনিট")
+    if s or not parts:
+        parts.append(f"{bn(s, 1)} সেকেন্ড")
+    return " ".join(parts)
+
+
+def power_label() -> str:
+    return {"on": BTN_PW_ON, "off": BTN_PW_OFF, "update": BTN_PW_UPD}.get(_BS["state"], BTN_PW_ON)
+
+
+def power_style() -> str:
+    return {"on": "success", "off": "danger", "update": "primary"}.get(_BS["state"], "success")
+
+
+def status_line() -> str:
+    st_ = _BS["state"]
+    if st_ == "off":
+        return "বট এখন: 🔴 OFF (ইউজাররা কোনো মেনু দেখছে না)"
+    if st_ == "update":
+        if _BS["until"]:
+            return f"বট এখন: 🛠 UPDATE MODE (বাকি {fmt_left(_BS['until'] - time.time())})"
+        return "বট এখন: 🛠 UPDATE MODE (Manual)"
+    return "বট এখন: 🟢 ON"
+
+
+def cd_alert() -> str:
+    if _BS["state"] == "update":
+        if _BS["until"]:
+            return f"🛠 আপডেট চলছে — বাকি {fmt_left(_BS['until'] - time.time())}"
+        return "🛠 আপডেট চলছে, একটু অপেক্ষা করুন"
+    if _BS["state"] == "off":
+        return "বট এখন বন্ধ আছে"
+    return "✅ আপডেট শেষ, বট চালু হয়েছে"
+
+
+def cd_markup(rem: float) -> InlineKeyboardMarkup:
+    """ইউজারদের পোস্টের নিচের লাইভ কাউন্টডাউন: ঘন্টা | মিনিট | সেকেন্ড"""
+    rem = max(0, int(rem))
+    h, r = divmod(rem, 3600)
+    m, s = divmod(r, 60)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"⏳ {bn(h)} ঘন্টা", callback_data="cd"),
+        InlineKeyboardButton(f"{bn(m)} মিনিট", callback_data="cd"),
+        InlineKeyboardButton(f"{bn(s)} সেকেন্ড", callback_data="cd"),
+    ]])
+
+
+def cd_done_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ আপডেট শেষ — বট চালু হয়েছে", callback_data="cd")]])
+
+
+_TIME_RE = re.compile(
+    r"(\d+)\s*(days?|d|hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s"
+    r"|দিন|ঘণ্টা|ঘন্টা|মিনিট|সেকেন্ড|সেকেণ্ড)",
+    re.I,
+)
+
+
+def parse_duration(raw: str):
+    """'1h30m', '45s', '২ ঘন্টা ১০ মিনিট' -> সেকেন্ড। ভুল হলে None"""
+    t = (raw or "").strip().lower().translate(_EN)
+    found = _TIME_RE.findall(t)
+    if not found:
+        return None
+    if re.sub(r"[\s,]|and|এবং", "", _TIME_RE.sub("", t)):
+        return None
+    total = 0
+    for num, unit in found:
+        u = unit[0]
+        mult = {"d": 86400, "দ": 86400, "h": 3600, "ঘ": 3600, "m": 60, "ম": 60, "s": 1, "স": 1}[u]
+        total += int(num) * mult
+    if total < UPD_MIN_SEC or total > UPD_MAX_SEC:
+        return None
+    return total
+
+
+def _bs_load():
+    snap = db.collection(BOT_SETTINGS).document("main").get()
+    d = (snap.to_dict() or {}) if snap.exists else {}
+    state = d.get("state") if d.get("state") in ("on", "off", "update") else "on"
+    msgs = []
+    if state == "update":
+        cs = db.collection(BOT_SETTINGS).document("countdown").get()
+        for x in ((cs.to_dict() or {}).get("msgs") or []) if cs.exists else []:
+            try:
+                c, m = str(x).split(":")
+                msgs.append((int(c), int(m)))
+            except ValueError:
+                pass
+    return state, float(d.get("until") or 0), msgs
+
+
+def _bs_save(data: dict):
+    db.collection(BOT_SETTINGS).document("main").set(data, merge=True)
+
+
+def _cd_save(msgs):
+    db.collection(BOT_SETTINGS).document("countdown").set({"msgs": [f"{c}:{m}" for c, m in msgs]})
+
+
+def _all_user_ids():
+    out = []
+    for d in db.collection(USERS).select(["username"]).stream():
+        if re.fullmatch(r"\d+", d.id):
+            out.append(int(d.id))
+    return out
+
+
+async def user_targets(exclude_admins: bool):
+    ids = await run(_all_user_ids)
+    if exclude_admins:
+        ids = [i for i in ids if i not in ADMIN_IDS]
+    return ids
+
+
+async def _safe_call(fn, item):
+    for _ in range(2):
+        try:
+            r = await fn(item)
+            return True if r is None else r
+        except RetryAfter as e:
+            ra = e.retry_after
+            await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else ra) + 1)
+        except TelegramError as e:
+            logging.info("broadcast item failed (%s): %s", item, e)
+            return None
+        except Exception:
+            logging.exception("broadcast item error")
+            return None
+    return None
+
+
+async def bcast(items, fn, per: int = 1):
+    """items এর প্রতিটার জন্য fn চালায়, টেলিগ্রাম লিমিটের ভেতরে থেকে। per = প্রতি আইটেমে কয়টা API কল।
+    রিটার্ন: (সফল, ব্যর্থ, {item: ফলাফল})"""
+    size = max(1, BCAST_RATE // max(1, per))
+    ok = fail = 0
+    res = {}
+    for i in range(0, len(items), size):
+        t0 = time.monotonic()
+        chunk = items[i:i + size]
+        outs = await asyncio.gather(*(_safe_call(fn, it) for it in chunk))
+        for it, o in zip(chunk, outs):
+            if o is None:
+                fail += 1
+            else:
+                ok += 1
+                res[it] = o
+        dt = time.monotonic() - t0
+        if i + size < len(items) and dt < 1:
+            await asyncio.sleep(1 - dt)
+    return ok, fail, res
+
+
+async def send_post(bot, cid, photo, html, markup=None) -> int:
+    """ছবি সহ (ক্যাপশন) অথবা শুধু টেক্সট পাঠায়। মেসেজ আইডি রিটার্ন করে।"""
+    if photo:
+        m = await bot.send_photo(cid, photo, caption=html or None, parse_mode="HTML", reply_markup=markup)
+    else:
+        m = await bot.send_message(
+            cid, html, parse_mode="HTML", reply_markup=markup,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    return m.message_id
+
+
+async def _rm_kb(bot, cid):
+    """ইউজারের স্ক্রিন থেকে রিপ্লাই-কীবোর্ড (মেনু) সরায়"""
+    m = await bot.send_message(cid, "🛠", reply_markup=ReplyKeyboardRemove(), disable_notification=True)
+    spawn(safe_delete(bot, cid, m.message_id))
+    return True
+
+
+async def _edit_cd(bot, item, final: bool = False):
+    cid, mid = item
+    markup = cd_done_markup() if final else cd_markup(_BS["until"] - time.time())
+    try:
+        await bot.edit_message_reply_markup(cid, mid, reply_markup=markup)
+    except BadRequest as e:
+        low = str(e).lower()
+        if "not modified" in low:
+            return True
+        if "not found" in low or "can't be edited" in low:
+            return "gone"
+        raise
+    except Forbidden:
+        return "gone"
+    return True
+
+
+async def set_power(app, on: bool) -> str:
+    """on=True: সব চালু (আপডেট মোডও শেষ)। on=False: বট বন্ধ। রিটার্ন: আগের অবস্থা"""
+    async with _BS_LOCK:
+        old = _BS["state"]
+        cd = _BS["cd"]
+        msgs = list(cd["msgs"]) if cd else []
+        _BS.update(state="on" if on else "off", until=0.0, cd=None)
+        _BS["tok"] += 1
+        try:
+            await run(_bs_save, {"state": _BS["state"], "until": 0.0})
+            await run(_cd_save, [])
+        except Exception as e:
+            logging.warning("bot state save error: %s", e)
+    if on and old != "on":
+        spawn(resume_job(app, msgs))
+    elif not on and old == "on":
+        spawn(off_job(app))
+    return old
+
+
+async def set_update(app, until: float) -> int:
+    async with _BS_LOCK:
+        _BS.update(state="update", until=until, cd=None)
+        _BS["tok"] += 1
+        tok = _BS["tok"]
+        try:
+            await run(_bs_save, {"state": "update", "until": until})
+            await run(_cd_save, [])
+        except Exception as e:
+            logging.warning("bot state save error: %s", e)
+    return tok
+
+
+async def end_update(app) -> bool:
+    if _BS["state"] != "update":
+        return False
+    await set_power(app, True)
+    return True
+
+
+async def off_job(app):
+    """বট OFF: ইউজারদের মেনু সরিয়ে দেয়"""
+    try:
+        users = await user_targets(True)
+
+        async def fn(cid):
+            if _BS["state"] != "off":   # এর মধ্যে আবার চালু হয়ে গেলে থেমে যাবে
+                return "skip"
+            return await _rm_kb(app.bot, cid)
+
+        await bcast(users, fn)
+    except Exception:
+        logging.exception("off_job error")
+
+
+async def resume_job(app, msgs):
+    """বট চালু: কাউন্টডাউন বাটন শেষ করে, সব ইউজারকে মেনু ফিরিয়ে দেয়"""
+    try:
+        bot = app.bot
+        if msgs:
+            await bcast(msgs, lambda it: _edit_cd(bot, it, final=True))
+        users = await user_targets(True)
+
+        async def fn(cid):
+            if _BS["state"] != "on":
+                return "skip"
+            m = await bot.send_message(
+                cid, "✅ বট আবার চালু হয়েছে\n\n" + menu_text(1), reply_markup=main_keyboard(1),
+            )
+            return m.message_id
+
+        await bcast(users, fn)
+        for cid, stc in list(app.bot_data.get("state", {}).items()):
+            if cid not in ADMIN_IDS:
+                stc["view"], stc["mode"], stc["labels"] = MAIN1, None, None
+    except Exception:
+        logging.exception("resume_job error")
+
+
+async def update_job(app, tok: int, photo, html: str, timer: bool):
+    """আপডেট পোস্ট সব ইউজারের কাছে পাঠায় (টাইমার হলে লাইভ কাউন্টডাউন বাটন সহ)"""
+    bot = app.bot
+    try:
+        users = await user_targets(True)
+        until = _BS["until"]
+
+        async def fn(cid):
+            if _BS["tok"] != tok:   # এর মধ্যে আপডেট শেষ/বদলে গেলে আর পাঠাবে না
+                return "skip"
+            if timer:
+                await _rm_kb(bot, cid)
+                return await send_post(bot, cid, photo, html, cd_markup(until - time.time()))
+            return await send_post(bot, cid, photo, html, ReplyKeyboardRemove())
+
+        ok, fail, res = await bcast(users, fn, per=2 if timer else 1)
+        msgs = [(c, m) for c, m in res.items() if isinstance(m, int) and not isinstance(m, bool)]
+        if timer:
+            async with _BS_LOCK:
+                live = _BS["tok"] == tok and _BS["state"] == "update"
+                if live:
+                    _BS["cd"] = {"msgs": msgs}
+                    try:
+                        await run(_cd_save, msgs)
+                    except Exception as e:
+                        logging.warning("countdown save error: %s", e)
+            if not live and msgs:   # পাঠাতে পাঠাতেই টাইমার শেষ
+                spawn(bcast(msgs, lambda it: _edit_cd(bot, it, final=True)))
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(aid, f"📣 আপডেট পোস্ট শেষ — ✅ {ok} জন, ❌ {fail} জন", disable_notification=True)
+            except TelegramError:
+                pass
+    except Exception:
+        logging.exception("update_job error")
+
+
+async def notice_job(app, admin_chat: int, users, photo, html: str):
+    """সকল ইউজারকে নোটিশ (ব্যাকগ্রাউন্ডে)"""
+    try:
+        async def fn(cid):
+            return await send_post(app.bot, cid, photo, html, None)
+
+        ok, fail, _ = await bcast(users, fn)
+        await app.bot.send_message(admin_chat, f"📢 নোটিশ পাঠানো শেষ — ✅ {ok} জন, ❌ {fail} জন")
+    except Exception:
+        logging.exception("notice_job error")
+
+
+async def _cd_tick(app):
+    try:
+        cd = _BS.get("cd")
+        if not cd or not cd["msgs"]:
+            return
+        ok, fail, res = await bcast(list(cd["msgs"]), lambda it: _edit_cd(app.bot, it))
+        gone = {it for it, r in res.items() if r == "gone"}
+        if gone and _BS.get("cd") is cd:
+            cd["msgs"] = [m for m in cd["msgs"] if m not in gone]
+    except Exception:
+        logging.exception("countdown tick error")
+    finally:
+        _BS["editing"] = False
+
+
+async def countdown_loop(app):
+    """প্রতি সেকেন্ডে চেক করে: টাইমার শেষ হলে বট অটো চালু, নাহলে কাউন্টডাউন বাটন আপডেট।
+    আপডেটের গতি ইউজার সংখ্যার ওপর নির্ভর করে (টেলিগ্রামের সেকেন্ডে ~30 মেসেজের লিমিট)।"""
+    last = 0.0
+    while True:
+        await asyncio.sleep(1)
+        try:
+            if _BS["state"] != "update" or not _BS["until"]:
+                continue
+            now = time.time()
+            if now >= _BS["until"]:
+                await end_update(app)
+                continue
+            cd = _BS.get("cd")
+            if cd and cd["msgs"] and not _BS["editing"]:
+                interval = max(1, math.ceil(len(cd["msgs"]) / max(1, BCAST_RATE)))
+                if now - last >= interval:
+                    last = now
+                    _BS["editing"] = True
+                    spawn(_cd_tick(app))
+        except Exception:
+            logging.exception("countdown loop error")
+
+
+# ---------- অ্যাডমিন মেনু: বাটন/টেক্সট হ্যান্ডলিং ----------
+async def cmp_cleanup(context, chat_id: int, st):
+    """প্রিভিউ মেসেজ মুছে ফেলে"""
+    mode = st.get("mode") or {}
+    pid = mode.pop("prev", None)
+    if pid:
+        if pid in st["keep"]:
+            st["keep"].remove(pid)
+        await safe_delete(context.bot, chat_id, pid)
+
+
+def cmp_source(k: str):
+    return V("upd") if k in ("um", "ut") else V("notice")
+
+
+async def adm_back(update, context, st, view):
+    """অ্যাডমিন মেনুর Back বাটন"""
+    vn = view.get("n")
+    if vn in ("upd", "notice"):
+        return await goto(update, context, V("admin"))
+    mode = st.get("mode")
+    if vn != "cmp" or not mode or mode.get("t") != "cmp":
+        return await goto(update, context, V("admin"))
+    k, s_ = mode["k"], view.get("s")
+    await cmp_cleanup(context, update.effective_chat.id, st)
+    prev = {
+        "img": "time" if k == "ut" else ("target" if k == "nu" else None),
+        "photo": "img",
+        "text": "photo" if mode.get("photo") else "img",
+        "ready": "text",
+    }.get(s_)
+    if prev is None:
+        return await goto(update, context, cmp_source(k))
+    return await goto(update, context, V("cmp", s=prev, k=k), mode=mode)
+
+
+async def cmp_execute(update, context, st, mode):
+    """Post / Send Notice চাপলে আসল কাজ"""
+    k = mode["k"]
+    photo, html = mode.get("photo"), mode["html"]
+    chat_id = update.effective_chat.id
+    app = context.application
+    if k == "nu":
+        uid = mode["target"]
+        try:
+            await send_post(context.bot, uid, photo, html, None)
+        except Forbidden:
+            return await goto(update, context, V("cmp", s="ready", k=k), mode=mode,
+                              extra="❌ পাঠানো যায়নি (ইউজার বটকে ব্লক করেছে)")
+        except TelegramError as e:
+            logging.warning("notice send error: %s", e)
+            return await goto(update, context, V("cmp", s="ready", k=k), mode=mode,
+                              extra="❌ পাঠানো যায়নি, একটু পরে আবার চেষ্টা করুন")
+        await cmp_cleanup(context, chat_id, st)
+        return await goto(update, context, V("notice"), extra=f"✅ নোটিশ পাঠানো হয়েছে — {mode.get('tname', uid)}")
+    if k == "na":
+        users = await user_targets(False)
+        await cmp_cleanup(context, chat_id, st)
+        if len(users) <= NOTICE_INLINE_MAX:
+            async def fn(cid):
+                return await send_post(context.bot, cid, photo, html, None)
+            ok, fail, _ = await bcast(users, fn)
+            return await goto(update, context, V("notice"), extra=f"📢 নোটিশ পাঠানো শেষ — ✅ {ok} জন, ❌ {fail} জন")
+        spawn(notice_job(app, chat_id, users, photo, html))
+        return await goto(update, context, V("notice"),
+                          extra=f"📢 {len(users)} জনকে পাঠানো শুরু হয়েছে, শেষ হলে জানাবো")
+    # আপডেট পোস্ট
+    timer = k == "ut"
+    until = time.time() + mode["secs"] if timer else 0.0
+    tok = await set_update(app, until)          # আগে আপডেট মোড চালু, তারপর পোস্ট
+    spawn(update_job(app, tok, photo, html, timer))
+    await cmp_cleanup(context, chat_id, st)
+    extra = "🛠 আপডেট মোড চালু হয়েছে — পোস্ট সবার কাছে যাচ্ছে"
+    if timer:
+        extra += f"\n⏱ {fmt_left(mode['secs'])} পর বট অটো চালু হবে"
+    return await goto(update, context, V("upd"), extra=extra)
+
+
+async def admin_text(update, context, st, view, text: str) -> bool:
+    """অ্যাডমিন প্যানেল/আপডেট/নোটিশ মেনুর টেক্সট ও বাটন। হ্যান্ডেল হলে True"""
+    vn = view.get("n")
+    app = context.application
+    chat_id = update.effective_chat.id
+
+    if vn == "admin":
+        if text in POWER_BTNS:
+            turn_on = _BS["state"] != "on"       # ON→OFF, OFF/UPDATE→ON
+            await set_power(app, turn_on)
+            msg = ("🟢 বট চালু হয়েছে — সব কার্যক্রম শুরু, ইউজারদের মেনু ফিরে যাচ্ছে" if turn_on
+                   else "🔴 বট বন্ধ হয়েছে — ইউজাররা কোনো মেনু দেখবে না")
+            await goto(update, context, V("admin"), extra=msg)
+            return True
+        if text == BTN_AD_NOTICE:
+            await goto(update, context, V("notice"))
+            return True
+        if text == BTN_AD_UPDATE:
+            await goto(update, context, V("upd"))
+            return True
+        if text in ADMIN_BTNS:
+            await goto(update, context, V("admin"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
+            return True
+        return False
+
+    if vn == "upd":
+        if text == BTN_UPD_LIVE and _BS["state"] == "update":
+            await end_update(app)
+            await goto(update, context, V("upd"), extra="✅ আপডেট মোড শেষ — সব কার্যক্রম চালু হয়েছে")
+            return True
+        if text == BTN_UPD_MANUAL:
+            await goto(update, context, V("cmp", s="img", k="um"), mode={"t": "cmp", "k": "um"})
+            return True
+        if text == BTN_UPD_TIMER:
+            await goto(update, context, V("cmp", s="time", k="ut"), mode={"t": "cmp", "k": "ut"})
+            return True
+        return False
+
+    if vn == "notice":
+        if text == BTN_NT_ALL:
+            await goto(update, context, V("cmp", s="img", k="na"), mode={"t": "cmp", "k": "na"})
+            return True
+        if text == BTN_NT_USER:
+            await goto(update, context, V("cmp", s="target", k="nu"), mode={"t": "cmp", "k": "nu"})
+            return True
+        return False
+
+    if vn == "cmp":
+        mode = st.get("mode")
+        if not mode or mode.get("t") != "cmp":   # রিস্টার্টের পর ইন-মেমোরি ডাটা হারিয়ে গেলে
+            await goto(update, context, V("admin"), extra="ℹ️ সেশন শেষ হয়ে গেছে, আবার শুরু করুন")
+            return True
+        k, s_ = mode["k"], view.get("s")
+
+        def same(extra):
+            return goto(update, context, V("cmp", s=s_, k=k), mode=mode, extra=extra)
+
+        if s_ == "time":
+            secs = parse_duration(text)
+            if secs is None:
+                await same("❌ সময় বোঝা যায়নি — যেমন: 30m, 2h, 1h30m")
+                return True
+            mode["secs"] = secs
+            await goto(update, context, V("cmp", s="img", k=k), mode=mode, extra=f"⏱ সময়: {fmt_left(secs)}")
+            return True
+        if s_ == "target":
+            t = text.strip()
+            uid = None
+            if re.fullmatch(r"\d{1,15}", t):
+                uid = int(t)
+                snap = await run(lambda: db.collection(USERS).document(str(uid)).get())
+                name = (snap.to_dict() or {}).get("name") if snap.exists else None
+                if not snap.exists:
+                    uid = None
+            elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", t):
+                uid = await run(_find_uid, t.lstrip("@"))
+                if uid:
+                    snap = await run(lambda: db.collection(USERS).document(str(uid)).get())
+                    name = (snap.to_dict() or {}).get("name") if snap.exists else None
+            if uid is None:
+                await same("❌ এই ইউজার বটে নেই (তাকে আগে /start দিতে হবে) — ID বা @username আবার দিন")
+                return True
+            mode["target"] = uid
+            mode["tname"] = f"{name or uid} ({uid})"
+            await goto(update, context, V("cmp", s="img", k=k), mode=mode, extra=f"👤 ইউজার: {mode['tname']}")
+            return True
+        if s_ == "img":
+            if text == BTN_CMP_NOIMG:
+                mode["photo"] = None
+                await goto(update, context, V("cmp", s="text", k=k), mode=mode)
+                return True
+            if text == BTN_CMP_IMG:
+                await goto(update, context, V("cmp", s="photo", k=k), mode=mode)
+                return True
+            return True
+        if s_ == "photo":
+            await same("⚠️ লেখা নয়, একটি ছবি পাঠান")
+            return True
+        if s_ == "text":
+            limit = 1024 if mode.get("photo") else 4000
+            if len(text) > limit:
+                await same(f"❌ টেক্সট অনেক বড় ({len(text)} অক্ষর) — সর্বোচ্চ {limit}" + (" (ছবির ক্যাপশন লিমিট)" if mode.get("photo") else ""))
+                return True
+            html = update.message.text_html
+            try:
+                pid = await send_post(context.bot, chat_id, mode.get("photo"), html, None)
+            except TelegramError as e:
+                logging.warning("preview error: %s", e)
+                await same("❌ প্রিভিউ বানানো যায়নি, টেক্সটটি আবার পাঠান")
+                return True
+            mode["html"] = html
+            mode["prev"] = pid
+            st["keep"].append(pid)
+            await goto(update, context, V("cmp", s="ready", k=k), mode=mode)
+            return True
+        if s_ == "ready":
+            if text in (BTN_CMP_POST, BTN_CMP_SEND):
+                await cmp_execute(update, context, st, mode)
+                return True
+            if text == BTN_CMP_CANCEL:
+                await cmp_cleanup(context, chat_id, st)
+                await goto(update, context, cmp_source(k), extra="❌ বাতিল করা হয়েছে")
+                return True
+            return True
+        return True
+    return False
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """বট OFF বা UPDATE মোডে থাকলে ইউজারের সব মেসেজ/বাটন চুপচাপ বন্ধ (মেসেজ মুছে যায়)।
+    অ্যাডমিন কখনো আটকায় না।"""
+    user = update.effective_user
+    if user is None or is_admin(user.id) or _BS["state"] == "on":
+        return
+    chat = update.effective_chat
+    if chat is not None and chat.type != "private":
+        return
+    q = update.callback_query
+    if q is not None:
+        try:
+            await q.answer(cd_alert() if q.data == "cd" else None)
+        except TelegramError:
+            pass
+    else:
+        msg = update.effective_message
+        if msg is not None:
+            spawn(safe_delete(context.bot, chat.id, msg.message_id))
+    raise ApplicationHandlerStop
+
+
+async def on_cd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """কাউন্টডাউন বাটনে ট্যাপ করলে ছোট নোটিফিকেশন"""
+    q = update.callback_query
+    try:
+        await q.answer(cd_alert())
+    except TelegramError:
+        pass
+
+
+@guarded
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """অ্যাডমিন পোস্ট/নোটিশের জন্য ছবি পাঠালে (শুধু ছবির ধাপে কাজ করে)"""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if user is None or not is_admin(user.id) or not update.message.photo:
+        return
+    async with get_lock(context, chat_id):
+        st = await get_state(context, user.id, chat_id)
+        view, mode = st["view"], st["mode"]
+        if view.get("n") != "cmp" or view.get("s") not in ("img", "photo") or not mode or mode.get("t") != "cmp":
+            return
+        mode["photo"] = update.message.photo[-1].file_id
+        await goto(update, context, V("cmp", s="text", k=mode["k"]), mode=mode)
+
+
+# ---------------------------------------------------------------
 # হ্যান্ডলার
 # ---------------------------------------------------------------
 # ---------------------------------------------------------------
@@ -1893,425 +2613,4 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ref_uid = int(m.group(1))
     async with get_lock(context, update.effective_chat.id):
         if ref_uid:
-            await handle_referral(update, context, ref_uid)   # পয়েন্ট আগে, মেনু পরে
-        await goto(update, context, MAIN1, is_start=True)
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/APDADMIN — শুধু অ্যাডমিনের জন্য। অন্য কেউ দিলে কোনো উত্তর/এরর কিছুই যাবে না।"""
-    user = update.effective_user
-    if user is None or not is_admin(user.id):
-        return
-    try:
-        async with get_lock(context, update.effective_chat.id):
-            await goto(update, context, V("admin"))
-    except Exception:
-        logging.exception("admin panel error")
-
-
-@guarded
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    async with get_lock(context, chat_id):
-        st = await get_state(context, user.id, chat_id)
-        view = st["view"]
-
-        # ---------- নেভিগেশন বাটন ----------
-        if text == NEXT:
-            return await goto(update, context, V("main", p=2))
-        if text == PREV or text == BTN_HOME:
-            return await goto(update, context, MAIN1)
-        if text == BTN_BACK:
-            vn_ = view.get("n")
-            if vn_ == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
-                return await goto(update, context, V("create", p=0))
-            if vn_ == "ar":
-                return await goto(update, context, V("vassist"))
-            if vn_ == "argen":
-                return await goto(update, context, V("ar"))
-            if vn_ == "arset":   # Reply Settings থেকে Back = Voice Assistant মেনু
-                return await goto(update, context, V("vassist"))
-            if vn_ == "avset":
-                return await goto(update, context, V("arset", p=0))
-            if vn_ in ("avchats", "avdel"):
-                return await goto(update, context, V("avset", i=view.get("i")))
-            if vn_ == "arprompt":
-                bk = (st["mode"] or {}).get("back")
-                return await goto(update, context, bk if isinstance(bk, dict) else V("ar"))
-            if vn_ == "allv" and view.get("ar"):   # Auto Reply এর Browse থেকে Back = Generate Voice
-                return await goto(update, context, V("argen", p=0))
-            if vn_ == "vlist":
-                return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
-            return await goto(update, context, V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats"):
-            nv = dict(view)
-            nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
-            return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
-        # ---------- অ্যাডমিন প্যানেলের বাটন (শুধু অ্যাডমিন, বাকিদের জন্য কিছুই হবে না) ----------
-        if text in ADMIN_BTNS and is_admin(user.id) and view.get("n") == "admin":
-            return await goto(update, context, V("admin"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
-        if text == BUTTONS["voice"]:
-            return await goto(update, context, V("voice"))
-        if text == BUTTONS["refer"]:
-            return await goto(update, context, V("refer"))
-        if text == BUTTONS["smm"]:
-            return await goto(update, context, V("smm"))
-        if text == BUTTONS["vassist"]:
-            return await goto(update, context, V("vassist"))
-        vn = view.get("n")
-        if text == BTN_VA_SET and vn == "vassist":
-            return await goto(update, context, V("ar"))
-        if text == BTN_VA_SETTINGS and vn == "vassist":   # অন/অফ + এডিট সিস্টেম এখানে
-            return await goto(update, context, V("arset", p=0))
-        if vn == "ar" and text == BTN_AR_GEN:
-            return await goto(update, context, V("argen", p=0))
-        # ---- Generate Voice: র‍্যান্ডম / Browse All Voices ----
-        if vn == "argen" and text == BTN_AR_RANDOM:
-            bk = V("argen", p=view.get("p", 0))
-            try:
-                v = await random_voice()
-            except Exception as e:
-                logging.warning("ar random voice error: %s", e)
-                return await goto(update, context, bk, extra=f"❌ ভয়েস লোড হয়নি ({api_error_text(e)})")
-            return await ar_pick_voice(
-                update, context, v, bk, rand=True,
-                extra=f"🎲 র‍্যান্ডম ভয়েস বাছাই হয়েছে — {v['name']}",
-            )
-        if vn == "argen" and text == BTN_AR_BROWSE:
-            return await goto(update, context, V("allv", ar=1))
-        if vn == "arprompt" and text == BTN_AR_REROLL and (st["mode"] or {}).get("rand"):
-            return await ar_reroll(update, context, st)
-        if vn == "avset" and text in AVSET_BTNS:
-            return await avset_action(update, context, st, view, text)
-        if vn == "avdel" and text in (BTN_DEL_YES, BTN_DEL_NO):
-            return await avdel_action(update, context, st, view, text)
-        if vn == "avchats" and not st["mode"]:   # রিস্টার্টের পর মোড ফিরিয়ে আনা
-            st["mode"] = {"t": "ar_chat", "i": view.get("i")}
-        if text == BUTTONS["reply"]:
-            return await goto(update, context, V("reply"))
-        if text in VA_BTNS and view.get("n") in ("vassist", "reply"):
-            return await goto(update, context, V(view["n"]), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
-        if text in SMM_BTNS and view.get("n") == "smm":
-            return await goto(update, context, V("smm"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
-        if text == BTN_ALL:
-            return await goto(update, context, V("allv"))
-        if text in (BTN_FEMALE, BTN_MALE):
-            g = "f" if text == BTN_FEMALE else "m"
-            if vn == "allv" and view.get("ar"):
-                return await goto(update, context, V("vlist", g=g, p=0, ar=1))
-            return await goto(update, context, V("vlist", g=g, p=0))
-        if text == BTN_CREATE:
-            return await goto(update, context, V("create", p=0))
-        if text == BTN_CLONE:
-            return await prompt(update, context, PROMPT_CLONE, {"t": "clone"})
-        if text == BTN_ADDID:
-            return await prompt(update, context, PROMPT_ADDID, {"t": "addid"})
-        if text == BTN_RANDOM:
-            try:
-                v = await random_voice()
-            except Exception as e:
-                logging.warning("random voice error: %s", e)
-                return await goto(update, context, V("create", p=0),
-                                  extra=f"❌ ভয়েস লোড হয়নি ({api_error_text(e)})")
-            return await start_gen(update, context, v)
-
-        # ---------- ইউজার কিছু লিখছে (মোড চালু) ----------
-        mode = st["mode"]
-        if mode:
-            t = mode["t"]
-            if t == "gen":
-                return await do_generate(update, context, st, text)
-            if t == "addid":
-                return await do_add_id(update, context, st, text)
-            if t == "send":
-                # লিস্ট থেকে গ্রুপ/চ্যানেল বাছাই
-                if mode.get("kind") == "group" and view.get("n") == "pick":
-                    c = (st["labels"] or {}).get(text)
-                    if c:
-                        return await deliver(update, context, st, c["id"], c["title"])
-                return await do_send(update, context, st, text)
-            if t == "clone":
-                return await prompt(update, context, PROMPT_CLONE, mode,
-                                    extra="⚠️ লেখা নয়, ভয়েস মেসেজ পাঠান")
-            if t == "ar_name":
-                return await do_ar_name(update, context, st, text)
-            if t == "ar_text":
-                return await do_ar_generate(update, context, st, text)
-            if t == "ar_trig":
-                return await do_ar_triggers(update, context, st, text)
-            if t == "ar_chat":
-                return await do_ar_chat_input(update, context, st, text)
-
-        # ---------- লিস্টের ভয়েস বাটন ----------
-        labels = st["labels"]
-        if labels is None:
-            try:
-                _, _, labels, _ = await render(view, st)
-            except Exception as e:
-                logging.warning("labels rebuild error: %s", e)
-                labels = {}
-            st["labels"] = labels
-        if text in labels:
-            v = labels[text]
-            n = view.get("n")
-            if n == "vlist" and view.get("ar"):   # Auto Reply: এই ভয়েস দিয়েই বানানো হবে
-                return await ar_pick_voice(
-                    update, context, v,
-                    V("vlist", g=view.get("g", "f"), p=view.get("p", 0), ar=1),
-                )
-            if n == "vlist":
-                added = await add_voice(st, {"id": v["id"], "name": v["name"], "kind": "lib"})
-                msg = f"✅ যোগ হয়েছে — {v['name']}" if added else f"ℹ️ আগেই যোগ করা আছে — {v['name']}"
-                return await goto(update, context, view, extra=msg)
-            if n == "create":
-                return await start_gen(update, context, v)
-            if n == "argen":
-                return await ar_pick_voice(update, context, v, V("argen", p=view.get("p", 0)))
-            if n == "arset":
-                return await ar_open(update, context, st, v)
-            if n == "pick":   # রিস্টার্টের পর ভয়েসের তথ্য হারিয়ে গেলে
-                return await goto(
-                    update, context, V("create", p=0),
-                    extra="ℹ️ ভয়েসের নিচের Send Group/Channel বাটনে আবার ক্লিক করুন",
-                )
-
-        # ---------- বাকি সার্ভিস বাটন ----------
-        if text in LABEL_TO_KEY:
-            mv = view if view.get("n") == "main" else MAIN1
-            return await goto(update, context, mv, text=f"{text}\n\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
-        # অন্য কোনো লেখা এলে কিছু মুছবে না
-
-
-@guarded
-async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ভয়েস ক্লোন: ইউজারের পাঠানো ভয়েস/অডিও দিয়ে Cartesia তে ক্লোন করে"""
-    msg = update.message
-    m = msg.voice or msg.audio
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    async with get_lock(context, chat_id):
-        st = await get_state(context, user.id, chat_id)
-        mode = st["mode"]
-        if not mode or mode.get("t") != "clone":
-            return
-
-        def retry(err):
-            return prompt(update, context, PROMPT_CLONE, mode, extra=err)
-
-        dur = m.duration or 0
-        if dur < CLONE_MIN_SEC:
-            return await retry(f"❌ ভয়েস খুব ছোট ({dur}s), কমপক্ষে {CLONE_MIN_SEC} সেকেন্ড দরকার")
-        if dur > CLONE_MAX_SEC:
-            return await retry(f"❌ ভয়েস অনেক বড় ({dur}s), সর্বোচ্চ {CLONE_MAX_SEC} সেকেন্ড")
-        if m.file_size and m.file_size > 15 * 1024 * 1024:
-            return await retry("❌ ফাইল অনেক বড় (সর্বোচ্চ 15MB)")
-
-        if msg.voice:
-            fname, mime = "clip.ogg", "audio/ogg"
-        else:
-            fname = m.file_name or "clip.mp3"
-            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "mp3"
-            if ext not in CLONE_EXTS:
-                return await retry("❌ ফরম্যাট সাপোর্ট নেই (mp3, wav, ogg, flac দিন)")
-            mime = m.mime_type or "audio/mpeg"
-
-        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-        try:
-            tg_file = await context.bot.get_file(m.file_id)
-            data = bytes(await tg_file.download_as_bytearray())
-            voices = await get_user_voices(st)
-            n = sum(1 for x in voices if x.get("kind") == "clone") + 1
-            name = f"My Clone {n}"
-            r = await HTTP.post(
-                f"{CARTESIA_URL}/voices/clone",
-                headers=_auth(),
-                data={"name": name, "language": CLONE_LANG, "access": "private"},
-                files={"clip": (fname, data, mime)},
-                timeout=180,
-            )
-            if r.status_code in (400, 422):
-                logging.warning("clone rejected: %s", r.text[:300])
-                return await retry("❌ ভয়েস ক্লোন হয়নি, স্পষ্ট ও নয়েজ-মুক্ত ভয়েস পাঠান")
-            r.raise_for_status()
-            j = r.json()
-            await add_voice(st, {"id": j["id"], "name": j.get("name") or name, "kind": "clone"})
-        except Exception as e:
-            logging.warning("clone error: %s", e)
-            return await retry(f"❌ ক্লোন করা যায়নি ({api_error_text(e)})")
-        await goto(
-            update, context, V("voice"),
-            extra=f"✅ ভয়েস ক্লোন হয়েছে — {name}\nCreate Voice এ গিয়ে ব্যবহার করুন",
-        )
-
-
-@guarded
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ভয়েসের নিচের Send Group/Channel ও Send User বাটন"""
-    q = update.callback_query
-    await q.answer()
-    msg = q.message
-    if msg is None:
-        return
-    if msg.voice:
-        fid, k = msg.voice.file_id, "voice"
-    elif msg.audio:
-        fid, k = msg.audio.file_id, "audio"
-    else:
-        return
-    kind = "group" if q.data == "send_group" else "user"
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    async with get_lock(context, chat_id):
-        await get_state(context, user.id, chat_id)
-        mode = {"t": "send", "kind": kind, "file_id": fid, "k": k}
-        if kind == "group":
-            await goto(update, context, V("pick", p=0), mode=mode)
-        else:
-            await prompt(update, context, PROMPT_USER, mode)
-
-
-async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """গ্রুপ/চ্যানেলে সেট করা টেক্সট মিললে সেই ভয়েস পাঠায় (Exact = হুবহু এক | Contains = মেসেজের ভেতরে থাকলেই)"""
-    try:
-        msg = update.effective_message
-        chat = update.effective_chat
-        if msg is None or chat is None or not msg.text or len(msg.text) > 300:
-            return
-        fu = msg.from_user
-        if fu and fu.is_bot and fu.id != 1087968824:   # অন্য বট বাদ (অ্যানোনিমাস অ্যাডমিন বাদে)
-            return
-        key = norm_key(msg.text)
-        if not key:
-            return
-        rules = await ar_rules_for(chat.id)
-        now = time.time()
-        # ১) আগে Exact মিল (হুবহু), ২) না পেলে Contains মিল (সবচেয়ে লম্বা মিলটা জেতে)
-        hit = None
-        for r in rules:
-            if r.get("on", True) and key in (r.get("keys") or ()):
-                hit = r
-                break
-        if hit is None:
-            skey = _VS_RE.sub("", key)
-            best = 0
-            for r in rules:
-                if not r.get("on", True) or r.get("match") != "contains":
-                    continue
-                for k in (r.get("keys") or ()):
-                    k = _VS_RE.sub("", k)
-                    if k and len(k) > best and contains_ok(k) and k in skey:
-                        best, hit = len(k), r
-        for r in ([hit] if hit else []):
-            ck = (chat.id, r["id"])
-            if now - _ar_last.get(ck, 0) < AR_COOLDOWN:
-                return
-            _ar_last[ck] = now
-            if len(_ar_last) > 5000:
-                _ar_last.clear()
-            send = context.bot.send_audio if r.get("k") == "audio" else context.bot.send_voice
-            arg = {"audio": r["file_id"]} if r.get("k") == "audio" else {"voice": r["file_id"]}
-            try:
-                if chat.type == "channel":
-                    await send(chat.id, **arg)
-                else:
-                    await send(chat.id, reply_parameters=ReplyParameters(
-                        message_id=msg.message_id, allow_sending_without_reply=True), **arg)
-            except TelegramError as e:
-                logging.warning("auto reply send error (%s): %s", chat.id, e)
-            return
-    except Exception:
-        logging.exception("on_chat_text error")
-
-
-async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """বটকে গ্রুপ/চ্যানেলে অ্যাডমিন বানালে/সরালে রেকর্ড রাখে (কে বানিয়েছে সহ)"""
-    try:
-        u = update.my_chat_member
-        chat = u.chat
-        if chat.type not in ("group", "supergroup", "channel"):
-            return
-        is_admin = u.new_chat_member.status == "administrator"
-        data = {
-            "title": chat.title or str(chat.id),
-            "type": chat.type,
-            "username": chat.username,
-            "admin": is_admin,
-            "updated": firestore.SERVER_TIMESTAMP,
-        }
-        by = u.from_user
-        if is_admin and by and not by.is_bot:
-            data["owner_id"] = by.id
-            data["owner_name"] = by.full_name
-        await run(_save_chat, chat.id, data)
-    except Exception:
-        logging.exception("my_chat_member error")
-
-
-async def post_init(app: Application):
-    global HTTP
-    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
-    _dv["lock"] = asyncio.Lock()
-    # বাম পাশের 3 লাইনের "Menu" বাটন সরানো
-    try:
-        await app.bot.delete_my_commands()
-        await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
-    except TelegramError as e:
-        logging.warning("menu button reset error: %s", e)
-
-
-# ---------------------------------------------------------------
-# Render + UptimeRobot এর জন্য ছোট ওয়েব সার্ভার
-# ---------------------------------------------------------------
-web = Flask(__name__)
-
-
-@web.route("/")
-def home():
-    return "Bot is running ✅"
-
-
-@web.route("/health")
-def health():
-    return "OK", 200
-
-
-def run_web():
-    web.run(host="0.0.0.0", port=PORT)
-
-
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .concurrent_updates(True)   # একজনের ভয়েস বানানো অন্যদের আটকে রাখবে না
-        .build()
-    )
-    app.add_handler(CommandHandler(["start", "menu"], cmd_menu, filters=filters.ChatType.PRIVATE))
-    # অ্যাডমিন প্যানেল: ফিল্টারেই শুধু ADMIN_ID এর ইউজার ঢুকতে পারে, বাকিদের জন্য হ্যান্ডলারই ট্রিগার হয় না
-    app.add_handler(CommandHandler(
-        "apdadmin", cmd_admin,
-        filters=filters.ChatType.PRIVATE & filters.User(user_id=list(ADMIN_IDS)),
-    ))
-    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO), on_audio))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
-    # গ্রুপ/চ্যানেলের টেক্সট -> অটো রিপ্লাই ভয়েস
-    app.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
-    app.run_polling(
-        allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"],
-        drop_pending_updates=True,
-    )
-
-
-if __name__ == "__main__":
-    main()
+            await 
