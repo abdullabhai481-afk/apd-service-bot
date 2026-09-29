@@ -2907,8 +2907,7 @@ async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if msg is None or chat is None or not msg.text or len(msg.text) > 300:
             return
-        if _BS["state"] != "on":   # বট OFF / আপডেট মোডে গ্রুপের অটো রিপ্লাইও বন্ধ
-            return
+        paused = _BS["state"] != "on"   # OFF / আপডেট মোডে শুধু অ্যাডমিনের নিজের অটো রিপ্লাই চলবে
         fu = msg.from_user
         if fu and fu.is_bot and fu.id != 1087968824:   # অন্য বট বাদ (অ্যানোনিমাস অ্যাডমিন বাদে)
             return
@@ -2916,6 +2915,8 @@ async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not key:
             return
         rules = await ar_rules_for(chat.id)
+        if paused:
+            rules = [r for r in rules if r.get("owner_id") in ADMIN_IDS]
         now = time.time()
         # ১) আগে Exact মিল (হুবহু), ২) না পেলে Contains মিল (সবচেয়ে লম্বা মিলটা জেতে)
         hit = None
