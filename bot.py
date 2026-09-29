@@ -359,7 +359,7 @@ AVSET_BTNS = (
     BTN_AR_ON, BTN_AR_OFF, BTN_AR_MATCH_EXACT, BTN_AR_MATCH_CONTAINS,
     BTN_AR_ADD, BTN_AR_REPL, BTN_AR_CHATS, BTN_AR_DEL,
 )
-AR_CONTAINS_MIN = 2     # "Contains" মোডে এর চেয়ে ছোট (অক্ষর) টেক্সট মেলানো হবে না
+AR_CONTAINS_MIN = 1     # "Contains" মোডে টেক্সটের সর্বনিম্ন দৈর্ঘ্য (১ = একটা অক্ষর/সংখ্যা/ইমোজিও চলবে)
 AR_VIEWS = ("ar", "argen", "arset", "avset", "avchats", "avdel", "arprompt")
 AR_MAX_TRIG = 200       # এক ভয়েসে সর্বোচ্চ কয়টা টেক্সট
 AR_COOLDOWN = 3         # একই গ্রুপে একই ভয়েস কমপক্ষে কত সেকেন্ড পর পর যাবে
@@ -824,6 +824,15 @@ def norm_key(t: str) -> str:
     t = unicodedata.normalize("NFC", t)
     t = "".join(ch for ch in t if not ch.isspace() and unicodedata.category(ch) != "Cf")
     return t.casefold()
+
+
+_VS_RE = re.compile("[\ufe0e\ufe0f]")   # ইমোজির variation selector (❤ আর ❤️ কে এক ধরতে)
+
+
+def contains_ok(k: str) -> bool:
+    """Contains মোডে টেক্সটটা মেলানোর যোগ্য কিনা: ইউজার যা সেট করেছে তাই চলবে
+    (একটা অক্ষর, সংখ্যা বা ইমোজিও)। শুধু খালি হলে না।"""
+    return len(k) >= AR_CONTAINS_MIN
 
 
 def parse_triggers(raw: str):
@@ -2130,12 +2139,14 @@ async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hit = r
                 break
         if hit is None:
+            skey = _VS_RE.sub("", key)
             best = 0
             for r in rules:
                 if not r.get("on", True) or r.get("match") != "contains":
                     continue
                 for k in (r.get("keys") or ()):
-                    if len(k) >= AR_CONTAINS_MIN and len(k) > best and k in key:
+                    k = _VS_RE.sub("", k)
+                    if k and len(k) > best and contains_ok(k) and k in skey:
                         best, hit = len(k), r
         for r in ([hit] if hit else []):
             ck = (chat.id, r["id"])
