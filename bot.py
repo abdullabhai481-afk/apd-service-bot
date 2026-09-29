@@ -280,6 +280,18 @@ BTN_RANDOM = "🎲 Select Random Voice"
 BTN_VPREV = "⬅️ Prev"
 BTN_VNEXT = "Next ➡️"
 
+# SMM Service সাব-মেনুর বাটন
+BTN_SMM_TG = "✈️ Telegram"
+BTN_SMM_FB = "📘 Facebook"
+BTN_SMM_YT = "▶️ YouTube"
+BTN_SMM_TT = "🎵 TikTok"
+SMM_BTNS = (BTN_SMM_TG, BTN_SMM_FB, BTN_SMM_YT, BTN_SMM_TT)
+
+# Voice Assistant সাব-মেনুর বাটন
+BTN_VA_SET = "🤖 Set Auto Reply"
+BTN_VA_SETTINGS = "⚙️ Reply Settings"
+VA_BTNS = (BTN_VA_SET, BTN_VA_SETTINGS)
+
 # ভয়েসের নিচের ইনলাইন বাটন
 SEND_KB = InlineKeyboardMarkup(
     [
@@ -724,6 +736,12 @@ async def prune_dead_voices(st):
 # ---------------------------------------------------------------
 # রেফার পেজের লেখা (HTML)
 # ---------------------------------------------------------------
+def _center(title: str, width: int) -> str:
+    """ব্লকের ভেতরে শিরোনাম মাঝখানে আনার আনুমানিক প্যাডিং (EM SPACE দিয়ে)"""
+    pad = max(0, int((width - len(title)) * 0.3))
+    return "\u2003" * pad + title
+
+
 async def refer_text(ctx) -> str:
     user = ctx["user"]
     bot_un = ctx.get("bot")
@@ -731,21 +749,18 @@ async def refer_text(ctx) -> str:
         raise RuntimeError("বটের username পাওয়া যায়নি")
     referrals, points = await run(_get_refer_stats, user.id)
     link = f"https://t.me/{bot_un}?start=ref_{user.id}"
-    uname = f"@{h_esc(user.username)}" if user.username else "সেট করা নেই"
+    name = user.full_name or "User"
+    if len(name) > 18:
+        name = name[:17] + "…"
+    who = h_esc(name) + (f"  •  @{h_esc(user.username)}" if user.username else "")
     boxes = [
-        f"👤 <b>টেলিগ্রাম নাম</b>\n{h_esc(user.full_name)}",
-        f"🔖 <b>টেলিগ্রাম ইউজারনেম</b>\n{uname}",
-        f"🆔 <b>ইউজার আইডি</b> <i>(ট্যাপ করলে কপি হবে)</i>\n<code>{user.id}</code>",
-        f"🎯 <b>রেফার পয়েন্ট</b>\nপ্রতি সফল রেফারে <b>{REFER_POINTS} পয়েন্ট</b>",
-        f"🔗 <b>রেফার লিংক</b> <i>(ট্যাপ করলে কপি হবে)</i>\n<code>{h_esc(link)}</code>",
-        f"📊 <b>আপনার রেফার:</b> {referrals} জন\n💎 <b>আপনার পয়েন্ট:</b> {points}",
+        f"👤 {who}",
+        f"🆔 <code>{user.id}</code>  •  🎯 প্রতি রেফারে <b>{REFER_POINTS} পয়েন্ট</b>",
+        f"<b>{_center('🔗 রেফার লিংক', len(link))}</b>\n<code>{h_esc(link)}</code>",
+        f"📊 রেফার: <b>{referrals}</b> জন  •  💎 পয়েন্ট: <b>{points}</b>",
     ]
     body = "\n".join(f"<blockquote>{b}</blockquote>" for b in boxes)
-    return (
-        "🎁 <b>REFER &amp; EARN</b>\n"
-        "বন্ধুদের ইনভাইট করুন, পয়েন্ট জিতুন!\n\n"
-        f"{body}"
-    )
+    return f"🎁 <b>REFER &amp; EARN</b>\n\n{body}"
 
 
 # ---------------------------------------------------------------
@@ -795,6 +810,22 @@ async def render(view, st=None, ctx=None):
             if pages > 1:
                 text += f" ({pg + 1}/{pages})"
         return text, kb(rows), labels, V("pick", p=pg)
+
+    if n in ("vassist", "reply"):
+        rows = [
+            [B(BTN_VA_SET), B(BTN_VA_SETTINGS)],
+            [B(BTN_HOME, NAV_STYLE)],
+        ]
+        title = BUTTONS["vassist"] if n == "vassist" else BUTTONS["reply"]
+        return f"{title}\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V(n)
+
+    if n == "smm":
+        rows = [
+            [B(BTN_SMM_TG), B(BTN_SMM_FB)],
+            [B(BTN_SMM_YT), B(BTN_SMM_TT)],
+            [B(BTN_HOME, NAV_STYLE)],
+        ]
+        return "📈 SMM Service\nআপনার পছন্দের প্ল্যাটফর্মটি বেছে নিন", kb(rows), labels, V("smm")
 
     if n == "voice":
         rows = [
@@ -1235,6 +1266,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await goto(update, context, V("voice"))
         if text == BUTTONS["refer"]:
             return await goto(update, context, V("refer"))
+        if text == BUTTONS["smm"]:
+            return await goto(update, context, V("smm"))
+        if text == BUTTONS["vassist"]:
+            return await goto(update, context, V("vassist"))
+        if text == BUTTONS["reply"]:
+            return await goto(update, context, V("reply"))
+        if text in VA_BTNS and view.get("n") in ("vassist", "reply"):
+            return await goto(update, context, V(view["n"]), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
+        if text in SMM_BTNS and view.get("n") == "smm":
+            return await goto(update, context, V("smm"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
         if text == BTN_ALL:
             return await goto(update, context, V("allv"))
         if text == BTN_FEMALE:
