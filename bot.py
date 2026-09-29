@@ -484,7 +484,15 @@ BTN_WL_RESET = "♻️ Reset Default"
 BTN_WL_PHOTO_ON = "🖼 Profile Photo: ON"
 BTN_WL_PHOTO_OFF = "🖼 Profile Photo: OFF"
 BTN_WL_PREVIEW = "👁 Preview"
-WL_VIEWS = ("wlc", "wl", "wlq")
+BTN_WL_LEAVE = "🚪 Leave Message"
+BTN_LV_ON = "🟢 Leave: ON"
+BTN_LV_OFF = "🔴 Leave: OFF"
+BTN_LV_EDIT = "✏️ Change Leave Message"
+BTN_LV_RESET = "♻️ Reset Leave Default"
+BTN_LV_PHOTO_ON = "🖼 Leave Photo: ON"
+BTN_LV_PHOTO_OFF = "🖼 Leave Photo: OFF"
+BTN_LV_PREVIEW = "👁 Leave Preview"
+WL_VIEWS = ("wlc", "wl", "wlq", "wll")
 WL_TTL = 120                   # গ্রুপের সেটিংস ক্যাশ (সেকেন্ড)
 WL_MAX_LEN = 1500              # ওয়েলকাম মেসেজের সর্বোচ্চ অক্ষর
 WL_DEFAULT = (
@@ -499,6 +507,12 @@ WL_DEFAULT = (
     "• ❌ এই গ্রুপে অন্য কোনো গ্রুপ, চ্যানেল, অথবা যেকোনো ধরনের লিংক পোস্ট করা কঠোরভাবে নিষিদ্ধ।\n"
     "• ⚠️ কেউ এই নিয়ম ভঙ্গ করলে প্রশাসনের সিদ্ধান্ত অনুযায়ী Mute অথবা Ban করা হবে।\n\n"
     "🤲 আল্লাহ তাআলা আমাদের সবাইকে সঠিক পথে চলার তাওফীক দান করুন। আমীন।🌿"
+)
+LV_DEFAULT = (
+    "অত্যন্ত দুঃখের সাথে জানানো যাচ্ছে যে, আবারও আমাদের চ্যানেল থেকে একজন প্রিয় মেম্বার বিদায় নিয়েছেন। 😔\n\n"
+    "ভালো থাকবেন, {name}। ❤️\n"
+    "আপনার জন্য রইলো অনেক শুভকামনা। কখনো যদি আমাদের কথা মনে পড়ে, "
+    "তাহলে আবার চলে আসবেন—আমরা আপনার জন্য অপেক্ষা করবো। 😊"
 )
 
 # ---------------------------------------------------------------
@@ -1408,7 +1422,8 @@ async def render_wl(view, st):
             f"👋 Welcome Message — {title}\n"
             f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n"
             f"🖼 জয়েন করা ইউজারের ছবি: {'✅ দেখাবে' if photo else '🚫 দেখাবে না'}\n"
-            f"📝 মেসেজ: {'✏️ কাস্টম' if custom else '📌 ডিফল্ট'}\n\n"
+            f"📝 মেসেজ: {'✏️ কাস্টম' if custom else '📌 ডিফল্ট'}\n"
+            f"🚪 Leave Message: {'🟢 ON' if cfg.get('leave_on') else '🔴 OFF'}\n\n"
             "কেউ জয়েন করলে এই মেসেজটা যাবে ({name} এর জায়গায় তার নাম বসবে, ক্লিক করলে প্রোফাইলে নিবে):\n\n"
             f"{tpl}\n\n"
             "{name} = জয়েন করা ইউজারের নাম (ক্লিকযোগ্য)\n"
@@ -1424,23 +1439,55 @@ async def render_wl(view, st):
             [B(BTN_WL_EDIT), B(BTN_WL_RESET)],
             [B(BTN_WL_PHOTO_ON if photo else BTN_WL_PHOTO_OFF, "success" if photo else "danger"),
              B(BTN_WL_PREVIEW)],
+            [B(BTN_WL_LEAVE, "success" if cfg.get("leave_on") else DEFAULT_STYLE)],
             nav,
         ]
         return text, kb(rows), labels, V("wl", c=cid)
 
-    if n == "wlq":
-        s_ = view.get("s")
-        if s_ != "txt":
-            raise RuntimeError("অজানা ধাপ")
+    if n == "wll":
+        lon = bool(cfg.get("leave_on"))
+        lphoto = cfg.get("leave_photo") is True
+        lcustom = bool(cfg.get("leave_text"))
+        ltpl = cfg.get("leave_text") or LV_DEFAULT
         text = (
-            "✏️ নতুন ওয়েলকাম মেসেজ লিখুন (সর্বোচ্চ ১৫০০ অক্ষর)\n\n"
-            "এগুলো ব্যবহার করতে পারবেন:\n"
-            "{name} = জয়েন করা ইউজারের নাম\n"
+            f"🚪 Leave Message — {title}\n"
+            f"অবস্থা: {'🟢 ON' if lon else '🔴 OFF'}\n"
+            f"🖼 লিভ নেওয়া ইউজারের ছবি: {'✅ দেখাবে' if lphoto else '🚫 দেখাবে না'}\n"
+            f"📝 মেসেজ: {'✏️ কাস্টম' if lcustom else '📌 ডিফল্ট'}\n\n"
+            "কেউ নিজে গ্রুপ/চ্যানেল থেকে লিভ নিলে এই মেসেজটা যাবে ({name} এর জায়গায় তার নাম বসবে):\n\n"
+            f"{ltpl}\n\n"
+            "{name} = লিভ নেওয়া ইউজারের নাম (ক্লিকযোগ্য)\n"
             "{username} = ইউজারনেম\n"
             "{id} = TG ID\n"
             "{group} = গ্রুপ/চ্যানেলের নাম\n\n"
-            "{name} না লিখলে সবার উপরে জয়েন করা ইউজারের নাম নিজে থেকেই বসবে।\n\n"
-            f"এখনকার মেসেজ:\n{tpl}"
+            "ℹ️ অ্যাডমিন কাউকে রিমুভ বা ব্যান করলে এই মেসেজ যাবে না, শুধু নিজে লিভ নিলে যাবে।\n"
+            "বটকে এখানে অ্যাডমিন রাখতে হবে।"
+        )
+        if cfg.get("type") == "channel":
+            text += "\nচ্যানেলে বটকে Post Messages পারমিশনও দিতে হবে।"
+        rows = [
+            [B(BTN_LV_ON if lon else BTN_LV_OFF, "success" if lon else "danger")],
+            [B(BTN_LV_EDIT), B(BTN_LV_RESET)],
+            [B(BTN_LV_PHOTO_ON if lphoto else BTN_LV_PHOTO_OFF, "success" if lphoto else "danger"),
+             B(BTN_LV_PREVIEW)],
+            nav,
+        ]
+        return text, kb(rows), labels, V("wll", c=cid)
+
+    if n == "wlq":
+        s_ = view.get("s")
+        if s_ not in ("txt", "ltxt"):
+            raise RuntimeError("অজানা ধাপ")
+        is_l = s_ == "ltxt"
+        text = (
+            f"✏️ নতুন {'লিভ' if is_l else 'ওয়েলকাম'} মেসেজ লিখুন (সর্বোচ্চ ১৫০০ অক্ষর)\n\n"
+            "এগুলো ব্যবহার করতে পারবেন:\n"
+            f"{{name}} = {'লিভ নেওয়া' if is_l else 'জয়েন করা'} ইউজারের নাম\n"
+            "{username} = ইউজারনেম\n"
+            "{id} = TG ID\n"
+            "{group} = গ্রুপ/চ্যানেলের নাম\n\n"
+            f"{{name}} না লিখলে সবার উপরে ইউজারের নাম নিজে থেকেই বসবে।\n\n"
+            f"এখনকার মেসেজ:\n{(cfg.get('leave_text') or LV_DEFAULT) if is_l else tpl}"
         )
         return text, kb([nav]), labels, V("wlq", s=s_, c=cid)
 
@@ -3637,11 +3684,14 @@ async def wl_perm_note(bot, cid, ctype) -> str:
     return ""
 
 
-def wl_build(cfg, fu, title) -> str:
-    """ওয়েলকাম মেসেজের HTML। {name} = ক্লিকযোগ্য নাম (প্রোফাইলে নিয়ে যায়)।
-    কাস্টম মেসেজে {name} না থাকলে সবার উপরে জয়েন করা ইউজারের নাম বসে।"""
+def wl_build(cfg, fu, title, leave: bool = False) -> str:
+    """ওয়েলকাম/লিভ মেসেজের HTML। {name} = ক্লিকযোগ্য নাম (প্রোফাইলে নিয়ে যায়)।
+    কাস্টম মেসেজে {name} না থাকলে সবার উপরে ইউজারের নাম বসে।"""
     mention, uname = lp_user_bits(fu)
-    tpl = cfg.get("text") or WL_DEFAULT
+    if leave:
+        tpl = cfg.get("leave_text") or LV_DEFAULT
+    else:
+        tpl = cfg.get("text") or WL_DEFAULT
     body = (
         h_esc(tpl)
         .replace("{name}", mention)
@@ -3651,7 +3701,7 @@ def wl_build(cfg, fu, title) -> str:
     )
     if "{name}" in tpl:
         return body
-    return f"👤 {mention} ({uname})\n\n" + body
+    return f"{'🚪' if leave else '👤'} {mention} ({uname})\n\n" + body
 
 
 def _plain_len(html: str) -> int:
@@ -3712,7 +3762,11 @@ async def wl_back(update, context, view):
         return await goto(update, context, MAIN1)
     if n == "wl":
         return await goto(update, context, V("wlc", p=0))
-    return await goto(update, context, V("wl", c=c))   # wlq
+    if n == "wll":
+        return await goto(update, context, V("wl", c=c))
+    if view.get("s") == "ltxt":   # wlq (লিভ মেসেজ লেখা)
+        return await goto(update, context, V("wll", c=c))
+    return await goto(update, context, V("wl", c=c))   # wlq (ওয়েলকাম মেসেজ লেখা)
 
 
 async def wl_text(update, context, st, view, text: str) -> bool:
@@ -3789,6 +3843,36 @@ async def wl_text(update, context, st, view, text: str) -> bool:
             await wl_send(context.bot, user.id, user.id,
                           wl_build(cfg, user, cfg.get("title")),
                           photo=cfg.get("photo", True) is not False)
+        elif text == BTN_WL_LEAVE:
+            await go(V("wll", c=cid))
+        return True
+
+    # ---------- Leave Message মেনু ----------
+    if n == "wll":
+        if text in (BTN_LV_ON, BTN_LV_OFF):
+            now_on = not cfg.get("leave_on")
+            await wl_save(cid, {"leave_on": now_on})
+            msg = "🟢 Leave Message চালু হয়েছে" if now_on else "🔴 Leave Message বন্ধ হয়েছে"
+            if now_on:
+                note = await wl_perm_note(context.bot, cid, cfg.get("type"))
+                if note:
+                    msg += "\n" + note
+            await go(V("wll", c=cid), extra=msg)
+        elif text == BTN_LV_EDIT:
+            await go(V("wlq", s="ltxt", c=cid))
+        elif text == BTN_LV_RESET:
+            await wl_save(cid, {"leave_text": None})
+            await go(V("wll", c=cid), extra="♻️ ডিফল্ট লিভ মেসেজ ফিরিয়ে আনা হয়েছে")
+        elif text in (BTN_LV_PHOTO_ON, BTN_LV_PHOTO_OFF):
+            new = cfg.get("leave_photo") is not True
+            await wl_save(cid, {"leave_photo": new})
+            await go(V("wll", c=cid),
+                     extra="🖼 লিভ নেওয়া ইউজারের ছবি দেখাবে" if new else "🖼 লিভ নেওয়া ইউজারের ছবি দেখাবে না")
+        elif text == BTN_LV_PREVIEW:
+            await go(V("wll", c=cid), extra="👁 নিচে প্রিভিউ দেখুন — কেউ লিভ নিলে এভাবেই যাবে")
+            await wl_send(context.bot, user.id, user.id,
+                          wl_build(cfg, user, cfg.get("title"), leave=True),
+                          photo=cfg.get("leave_photo") is True)
         return True
 
     # ---------- মেসেজ লেখা ----------
@@ -3799,6 +3883,14 @@ async def wl_text(update, context, st, view, text: str) -> bool:
             return True
         await wl_save(cid, {"text": t})
         await go(V("wl", c=cid), extra="✅ ওয়েলকাম মেসেজ বদলানো হয়েছে")
+        return True
+    if n == "wlq" and view.get("s") == "ltxt":
+        t = text.strip()
+        if not t or len(t) > WL_MAX_LEN:
+            await go(V("wlq", s="ltxt", c=cid), extra=f"❌ মেসেজ ১ থেকে {WL_MAX_LEN} অক্ষরের মধ্যে হতে হবে")
+            return True
+        await wl_save(cid, {"leave_text": t})
+        await go(V("wll", c=cid), extra="✅ লিভ মেসেজ বদলানো হয়েছে")
         return True
     return True
 
@@ -3824,6 +3916,26 @@ async def wl_welcome(bot, chat, fu):
                   photo=cfg.get("photo", True) is not False)
 
 
+async def wl_leave(bot, chat, fu):
+    """কেউ নিজে লিভ নিলে (Leave ON থাকলে) বিদায়ী মেসেজ পোস্ট করে"""
+    if fu is None or fu.is_bot:
+        return
+    key = ("L", chat.id, fu.id)
+    now = time.time()
+    if now - _wl_recent.get(key, 0) < 30:   # একই লিভের দুইটা আপডেটে একবারই যাবে
+        return
+    _wl_recent[key] = now
+    if len(_wl_recent) > 5000:
+        _wl_recent.clear()
+    cfg = await wl_cfg(chat.id)
+    if not cfg or not cfg.get("leave_on"):
+        return
+    if _BS["state"] != "on" and cfg.get("owner_id") not in ADMIN_IDS:
+        return
+    await wl_send(bot, chat.id, fu.id, wl_build(cfg, fu, chat.title, leave=True),
+                  photo=cfg.get("leave_photo") is True)
+
+
 def _wl_is_member(m) -> bool:
     return m.status in ("member", "administrator", "creator") or (
         m.status == "restricted" and bool(getattr(m, "is_member", False))
@@ -3836,9 +3948,14 @@ async def on_member_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u = update.chat_member
         if u is None or u.chat.type not in ("group", "supergroup", "channel"):
             return
-        if _wl_is_member(u.old_chat_member) or not _wl_is_member(u.new_chat_member):
-            return
-        await wl_welcome(context.bot, u.chat, u.new_chat_member.user)
+        was, now = _wl_is_member(u.old_chat_member), _wl_is_member(u.new_chat_member)
+        user_ = u.new_chat_member.user
+        if not was and now:
+            await wl_welcome(context.bot, u.chat, user_)
+        elif was and not now and u.new_chat_member.status == "left":
+            # শুধু নিজে লিভ নিলে (অ্যাডমিন রিমুভ/ব্যান করলে নয়)
+            if u.from_user is not None and u.from_user.id == user_.id:
+                await wl_leave(context.bot, u.chat, user_)
     except Exception:
         logging.exception("on_member_join error")
 
@@ -3854,6 +3971,20 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wl_welcome(context.bot, chat, u)
     except Exception:
         logging.exception("on_new_members error")
+
+
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপে 'লিভ নিয়েছে' সার্ভিস মেসেজ এলে (বাড়তি নিরাপত্তা, ডুপ্লিকেট আটকানো আছে)"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or chat.type not in ("group", "supergroup"):
+            return
+        lm = msg.left_chat_member
+        if lm is not None and msg.from_user is not None and msg.from_user.id == lm.id:
+            await wl_leave(context.bot, chat, lm)
+    except Exception:
+        logging.exception("on_left_member error")
 
 
 async def notify_referrer(bot, ref_uid: int, name: str):
@@ -4336,6 +4467,7 @@ def main():
     # Welcome Message: নতুন সদস্য জয়েন করলে
     app.add_handler(ChatMemberHandler(on_member_join, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
     app.add_handler(CallbackQueryHandler(on_cd, pattern="^cd$"))
     app.add_handler(CallbackQueryHandler(on_pv_end, pattern="^pv_end$"))
