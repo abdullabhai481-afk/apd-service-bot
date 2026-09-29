@@ -342,7 +342,9 @@ VA_BTNS = (BTN_VA_SET, BTN_VA_SETTINGS)
 
 # Set Auto Reply সাব-মেনুর বাটন (Voice Assistant)
 BTN_AR_GEN = "🎙 Generate Voice"
-BTN_AR_SET = "⚙️ Settings"
+BTN_AR_RANDOM = "🎲 Random Voice"          # Generate Voice: যেকোনো র‍্যান্ডম ভয়েস
+BTN_AR_BROWSE = "🎭 Browse All Voices"     # Generate Voice: সব ভয়েস ঘুরে দেখে বাছাই
+BTN_AR_REROLL = "🔄 Another Random Voice"  # র‍্যান্ডম বেছে নেওয়ার পর নতুন র‍্যান্ডম ভয়েস
 BTN_AR_ON = "🟢 Auto Reply: ON"
 BTN_AR_OFF = "🔴 Auto Reply: OFF"
 BTN_AR_ADD = "➕ Add Texts"
@@ -404,6 +406,11 @@ PAGE_NAMES = {1: "প্রথম পেজ", 2: "দ্বিতীয় প�
 
 def menu_text(page: int) -> str:
     return f"{PAGE_NAMES[page]}\nআপনার পছন্দের সার্ভিসটি বেছে নিন"
+
+
+def vemoji(v) -> str:
+    """ক্লোন ভয়েস = 🧬, বাকি সব সেভ করা ভয়েস = 🎤"""
+    return "🧬" if v.get("kind") == "clone" else "🎤"
 
 
 def uniq_label(prefix: str, name: str, used) -> str:
@@ -684,13 +691,15 @@ DEEP_RE = re.compile(
     r"senior|authoritative|gruff|resonant|commanding|booming|smoky)\b", re.I)
 
 
-async def random_voice():
+async def random_voice(exclude=None):
+    """exclude = যে ভয়েস আইডি বাদ দিয়ে নতুন একটা চাই (আবার র‍্যান্ডম করার সময়)"""
     allv = (await get_default_voices("f")) + (await get_default_voices("m"))
     pool = (
         [v for v in allv if YOUNG_RE.search(v["desc"]) and not DEEP_RE.search(v["desc"])]
         or [v for v in allv if not DEEP_RE.search(v["desc"])]
         or allv
     )
+    pool = [v for v in pool if v["id"] != exclude] or pool
     return random.choice(pool)
 
 
@@ -776,7 +785,11 @@ async def prune_dead_voices(st):
     try:
         lst = await get_user_voices(st)
         now = time.time()
-        todo = [v["id"] for v in lst if now - _VALID.get(v["id"], 0) > VALID_TTL]
+        # ক্লোন ভয়েস এখানে কখনো অটো-মোছা হয় না (একটা ভুল/সাময়িক 404 এ ক্লোন হারিয়ে যেত)
+        todo = [
+            v["id"] for v in lst
+            if v.get("kind") != "clone" and now - _VALID.get(v["id"], 0) > VALID_TTL
+        ]
         if not todo:
             return
         sem = asyncio.Semaphore(5)
@@ -901,34 +914,57 @@ async def render(view, st=None, ctx=None):
 
     if n == "ar":
         rows = [
-            [B(BTN_AR_GEN), B(BTN_AR_SET)],
+            [B(BTN_AR_GEN)],
             [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)],
         ]
-        return "🤖 Set Auto Reply\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V("ar")
+        text = (
+            "🤖 Set Auto Reply\n"
+            "নতুন অটো রিপ্লাই ভয়েস বানান\n\n"
+            "⚙️ অন/অফ, টেক্সট এডিট, গ্রুপ/চ্যানেল ও ডিলিট — এসব এখন\n"
+            "Voice Assistant → Reply Settings এ পাবেন"
+        )
+        return text, kb(rows), labels, V("ar")
 
     if n == "arprompt":
-        rows = [[B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
-        return "নিচের Back বা Home চাপুন", kb(rows), labels, V("arprompt")
+        rr = bool(view.get("rr"))
+        rows = ([[B(BTN_AR_REROLL)]] if rr else []) + [[B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
+        return "নিচের Back বা Home চাপুন", kb(rows), labels, (V("arprompt", rr=1) if rr else V("arprompt"))
 
     if n == "argen":
-        voices = [v for v in await get_user_voices(st) if v.get("kind") == "clone"]
+        saved = await get_user_voices(st)
+        # ক্লোন ভয়েস আগে, তারপর বাকি সেভ করা ভয়েস (Add by ID / All Voices থেকে যোগ করা)
+        voices = [v for v in saved if v.get("kind") == "clone"] + [
+            v for v in saved if v.get("kind") != "clone"
+        ]
+        n_clone = sum(1 for v in voices if v.get("kind") == "clone")
         pages = max(1, math.ceil(len(voices) / PER_PAGE))
         pg = min(max(int(view.get("p", 0)), 0), pages - 1)
         btns = []
         for v in voices[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
-            label = uniq_label("🧬", v["name"], labels)
+            label = uniq_label(vemoji(v), v["name"], labels)
             labels[label] = v
             btns.append(B(label))
-        rows = pair(btns)
+        rows = [[B(BTN_AR_RANDOM), B(BTN_AR_BROWSE)]] + pair(btns)
         nav = page_nav(pg, pages)
         if nav:
             rows.append(nav)
         rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
-        text = "🎙 Generate Voice\nযে ক্লোন ভয়েস দিয়ে বানাতে চান সেটি বেছে নিন"
-        if not voices:
-            text += "\n\n(কোনো ক্লোন ভয়েস নেই — Voice Generate → Clone Voice থেকে আগে ক্লোন করুন)"
-        elif pages > 1:
-            text += f" ({pg + 1}/{pages})"
+        text = (
+            "🎙 Generate Voice\n"
+            "যে ভয়েস দিয়ে বানাতে চান সেটি বেছে নিন\n\n"
+            "🎲 Random Voice — যেকোনো একটা র‍্যান্ডম ভয়েস\n"
+            "🎭 Browse All Voices — সব ভয়েস ঘুরে দেখে নিজের পছন্দমতো"
+        )
+        if voices:
+            text += (
+                f"\n\n🧬 ক্লোন: {n_clone}টি  •  🎤 অন্যান্য: {len(voices) - n_clone}টি"
+                + (f"  ({pg + 1}/{pages})" if pages > 1 else "")
+            )
+        else:
+            text += (
+                "\n\n(এখনো কোনো সেভ করা ভয়েস নেই — র‍্যান্ডম বা Browse All Voices থেকে বাছুন, "
+                "অথবা Voice Generate → Clone Voice থেকে ক্লোন করুন)"
+            )
         return text, kb(rows), labels, V("argen", p=pg)
 
     if n == "arset":
@@ -945,9 +981,13 @@ async def render(view, st=None, ctx=None):
         if nav:
             rows.append(nav)
         rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
-        text = "⚙️ Settings\nসেট করতে চান এমন ভয়েস বেছে নিন\n🟢 চালু   🔴 বন্ধ"
+        text = (
+            "⚙️ Reply Settings\n"
+            "যে ভয়েসের অন/অফ, টেক্সট বা গ্রুপ/চ্যানেল বদলাতে চান সেটি বেছে নিন\n"
+            "🟢 চালু   🔴 বন্ধ"
+        )
         if not items:
-            text += "\n\n(এখনো কোনো ভয়েস নেই — আগে Generate Voice থেকে বানান)"
+            text += "\n\n(এখনো কোনো ভয়েস নেই — আগে Set Auto Reply → Generate Voice থেকে বানান)"
         elif pages > 1:
             text += f"\n({pg + 1}/{pages})"
         return text, kb(rows), labels, V("arset", p=pg)
@@ -1084,8 +1124,12 @@ async def render(view, st=None, ctx=None):
         return "🎙 Voice Generate\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V("voice")
 
     if n == "allv":
+        ar = bool(view.get("ar"))   # Auto Reply এর Browse থেকে এলে true
         rows = [[B(BTN_FEMALE), B(BTN_MALE)], [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
-        return "🎭 All Voices\nকোন ধরনের ভয়েস দেখতে চান?", kb(rows), labels, V("allv")
+        text = "🎭 All Voices\nকোন ধরনের ভয়েস দেখতে চান?"
+        if ar:
+            text += "\n\n(যে ভয়েস বেছে নেবেন সেটা দিয়ে অটো রিপ্লাই ভয়েস বানানো হবে)"
+        return text, kb(rows), labels, (V("allv", ar=1) if ar else V("allv"))
 
     if n == "vlist":
         g = "m" if view.get("g") == "m" else "f"
@@ -1108,11 +1152,15 @@ async def render(view, st=None, ctx=None):
             rows.append(nav)
         rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
         title = "Male" if g == "m" else "Female"
-        text = (
-            f"{emoji} {title} Voices ({pg + 1}/{pages})\n"
+        ar = bool(view.get("ar"))
+        hint = (
+            "যে ভয়েসে ক্লিক করবেন সেটা দিয়ে অটো রিপ্লাই ভয়েস বানানো হবে"
+            if ar else
             "যে ভয়েসে ক্লিক করবেন সেটা আপনার Create Voice লিস্টে যোগ হবে"
         )
-        return text, kb(rows), labels, V("vlist", g=g, p=pg)
+        text = f"{emoji} {title} Voices ({pg + 1}/{pages})\n{hint}"
+        nv = V("vlist", g=g, p=pg, ar=1) if ar else V("vlist", g=g, p=pg)
+        return text, kb(rows), labels, nv
 
     if n == "create":
         if st is None:
@@ -1122,7 +1170,7 @@ async def render(view, st=None, ctx=None):
         pg = min(max(int(view.get("p", 0)), 0), pages - 1)
         btns = []
         for v in voices[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
-            label = uniq_label("🎤", v["name"], labels)
+            label = uniq_label(vemoji(v), v["name"], labels)
             labels[label] = v
             btns.append(B(label))
         rows = [[B(BTN_RANDOM)]] + pair(btns)
@@ -1268,6 +1316,8 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
             fb, err = MAIN1, "❌ রেফার পেজ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("n") in AR_VIEWS:
             fb, err = V("ar"), "❌ লোড হয়নি, আবার চেষ্টা করুন"
+        elif view.get("ar"):   # Auto Reply এর Browse All Voices লোড না হলে
+            fb, err = V("ar"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         else:
             fb, err = V("voice"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         rtext, markup, labels, view = await render(fb)
@@ -1382,7 +1432,13 @@ async def do_add_id(update, context, st, text: str):
         if j.get("status") == "archived":
             return await prompt(update, context, PROMPT_ADDID, mode, extra="❌ ভয়েসটি আর্কাইভ করা")
         added = await add_voice(
-            st, {"id": j.get("id") or vid, "name": j.get("name") or "Voice", "kind": "id"}
+            st,
+            {
+                "id": j.get("id") or vid,
+                "name": j.get("name") or "Voice",
+                # নিজের অ্যাকাউন্টের (ক্লোন করা) ভয়েস হলে 🧬 ক্লোন হিসেবে দেখাবে
+                "kind": "clone" if j.get("is_owner") else "id",
+            },
         )
     except Exception as e:
         logging.warning("add id error: %s", e)
@@ -1476,8 +1532,56 @@ def trig_prompt(name: str, kind: str) -> str:
     )
 
 
+def ar_head(mode) -> str:
+    """প্রম্পটের নিচে দেখানো ভয়েসের লাইন: 🧬 ক্লোন | 🎲 র‍্যান্ডম | 🎤 অন্য"""
+    if mode.get("vk") == "clone":
+        e = "🧬"
+    elif mode.get("rand"):
+        e = "🎲"
+    else:
+        e = "🎤"
+    return f"{e} {mode['cname']}"
+
+
+def ar_gen_text(mode) -> str:
+    """ভয়েস বাছাইয়ের পরের ধাপের লেখা (নাম চাওয়া / টেক্সট চাওয়া)"""
+    if mode.get("t") == "ar_text":
+        return f"{PROMPT_AR_TEXT}\n\n🎙 {mode['aname']}\n{ar_head(mode)}"
+    return f"{PROMPT_AR_NAME}\n\n{ar_head(mode)}"
+
+
 async def ar_prompt(update, context, text, mode, extra=None):
-    return await goto(update, context, V("arprompt"), text=text, extra=extra, mode=mode)
+    # র‍্যান্ডম ভয়েস হলে নিচে "Another Random Voice" বাটন থাকবে
+    view = V("arprompt", rr=1) if mode and mode.get("rand") else V("arprompt")
+    return await goto(update, context, view, text=text, extra=extra, mode=mode)
+
+
+async def ar_pick_voice(update, context, v, back, rand=False, extra=None):
+    """অটো রিপ্লাইয়ের জন্য একটা ভয়েস বাছাই হলে পরের ধাপে (নাম দেওয়া) যায়"""
+    mode = {
+        "t": "ar_name", "cvid": v["id"], "cname": v["name"],
+        "vk": v.get("kind"), "back": back,
+    }
+    if rand:
+        mode["rand"] = True
+    return await ar_prompt(update, context, ar_gen_text(mode), mode, extra=extra)
+
+
+async def ar_reroll(update, context, st):
+    """র‍্যান্ডম মোডে নতুন আরেকটা র‍্যান্ডম ভয়েস বাছে (নাম/টেক্সট আগের মতোই থাকে)"""
+    mode = st["mode"]
+    try:
+        v = await random_voice(exclude=mode.get("cvid"))
+    except Exception as e:
+        logging.warning("reroll error: %s", e)
+        return await ar_prompt(
+            update, context, ar_gen_text(mode), mode,
+            extra=f"❌ নতুন ভয়েস লোড হয়নি ({api_error_text(e)})",
+        )
+    nm = dict(mode, cvid=v["id"], cname=v["name"], vk=None, rand=True)
+    return await ar_prompt(
+        update, context, ar_gen_text(nm), nm, extra=f"🎲 নতুন র‍্যান্ডম ভয়েস — {v['name']}"
+    )
 
 
 async def ar_open(update, context, st, item):
@@ -1498,17 +1602,17 @@ async def do_ar_name(update, context, st, text: str):
     name = " ".join(text.split())
     if not name or len(name) > 25:
         return await ar_prompt(
-            update, context, f"{PROMPT_AR_NAME}\n\n🧬 {mode['cname']}", mode,
+            update, context, ar_gen_text(mode), mode,
             extra="⚠️ নাম ১ থেকে ২৫ অক্ষরের মধ্যে দিন",
         )
     nm = dict(mode, t="ar_text", aname=name)
-    return await ar_prompt(update, context, f"{PROMPT_AR_TEXT}\n\n🎙 {name}\n🧬 {mode['cname']}", nm)
+    return await ar_prompt(update, context, ar_gen_text(nm), nm)
 
 
 async def do_ar_generate(update, context, st, text: str):
     mode = st["mode"]
     chat_id = update.effective_chat.id
-    ptxt = f"{PROMPT_AR_TEXT}\n\n🎙 {mode['aname']}\n🧬 {mode['cname']}"
+    ptxt = ar_gen_text(mode)
     if len(text) > MAX_TEXT:
         return await ar_prompt(update, context, ptxt, mode, extra=f"⚠️ লেখা অনেক বড় (সর্বোচ্চ {MAX_TEXT} অক্ষর)")
     await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
@@ -1525,8 +1629,8 @@ async def do_ar_generate(update, context, st, text: str):
             if await voice_exists(mode["cvid"]) is False:
                 n = await remove_voices(st, {mode["cvid"]})
                 note = (
-                    f"🗑 ক্লোন ভয়েসটি আর পাওয়া যায়নি, তাই লিস্ট থেকে মুছে ফেলা হয়েছে — {mode['cname']}"
-                    if n else f"❌ ক্লোন ভয়েসটি পাওয়া যায়নি — {mode['cname']}"
+                    f"🗑 ভয়েসটি আর পাওয়া যায়নি, তাই লিস্ট থেকে মুছে ফেলা হয়েছে — {mode['cname']}"
+                    if n else f"❌ ভয়েসটি পাওয়া যায়নি, অন্য ভয়েস বেছে নিন — {mode['cname']}"
                 )
                 return await goto(update, context, V("argen", p=0), extra=note)
         return await ar_prompt(update, context, ptxt, mode,
@@ -1549,7 +1653,10 @@ async def do_ar_generate(update, context, st, text: str):
     ar_invalidate()
     await goto(
         update, context, V("ar"),
-        extra=f"✅ ভয়েস তৈরি হয়েছে — {mode['aname']}\n⚙️ Settings থেকে টেক্সট ও গ্রুপ/চ্যানেল সেট করুন",
+        extra=(
+            f"✅ ভয়েস তৈরি হয়েছে — {mode['aname']}\n"
+            "⚙️ Voice Assistant → Reply Settings থেকে টেক্সট ও গ্রুপ/চ্যানেল সেট করুন"
+        ),
     )
 
 
@@ -1739,8 +1846,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await goto(update, context, V("create", p=0))
             if vn_ == "ar":
                 return await goto(update, context, V("vassist"))
-            if vn_ in ("argen", "arset"):
+            if vn_ == "argen":
                 return await goto(update, context, V("ar"))
+            if vn_ == "arset":   # Reply Settings থেকে Back = Voice Assistant মেনু
+                return await goto(update, context, V("vassist"))
             if vn_ == "avset":
                 return await goto(update, context, V("arset", p=0))
             if vn_ in ("avchats", "avdel"):
@@ -1748,7 +1857,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if vn_ == "arprompt":
                 bk = (st["mode"] or {}).get("back")
                 return await goto(update, context, bk if isinstance(bk, dict) else V("ar"))
-            return await goto(update, context, V("allv") if view.get("n") == "vlist" else V("voice"))
+            if vn_ == "allv" and view.get("ar"):   # Auto Reply এর Browse থেকে Back = Generate Voice
+                return await goto(update, context, V("argen", p=0))
+            if vn_ == "vlist":
+                return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
+            return await goto(update, context, V("voice"))
         if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
@@ -1764,10 +1877,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vn = view.get("n")
         if text == BTN_VA_SET and vn == "vassist":
             return await goto(update, context, V("ar"))
+        if text == BTN_VA_SETTINGS and vn == "vassist":   # অন/অফ + এডিট সিস্টেম এখানে
+            return await goto(update, context, V("arset", p=0))
         if vn == "ar" and text == BTN_AR_GEN:
             return await goto(update, context, V("argen", p=0))
-        if vn == "ar" and text == BTN_AR_SET:
-            return await goto(update, context, V("arset", p=0))
+        # ---- Generate Voice: র‍্যান্ডম / Browse All Voices ----
+        if vn == "argen" and text == BTN_AR_RANDOM:
+            bk = V("argen", p=view.get("p", 0))
+            try:
+                v = await random_voice()
+            except Exception as e:
+                logging.warning("ar random voice error: %s", e)
+                return await goto(update, context, bk, extra=f"❌ ভয়েস লোড হয়নি ({api_error_text(e)})")
+            return await ar_pick_voice(
+                update, context, v, bk, rand=True,
+                extra=f"🎲 র‍্যান্ডম ভয়েস বাছাই হয়েছে — {v['name']}",
+            )
+        if vn == "argen" and text == BTN_AR_BROWSE:
+            return await goto(update, context, V("allv", ar=1))
+        if vn == "arprompt" and text == BTN_AR_REROLL and (st["mode"] or {}).get("rand"):
+            return await ar_reroll(update, context, st)
         if vn == "avset" and text in AVSET_BTNS:
             return await avset_action(update, context, st, view, text)
         if vn == "avdel" and text in (BTN_DEL_YES, BTN_DEL_NO):
@@ -1782,10 +1911,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await goto(update, context, V("smm"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
         if text == BTN_ALL:
             return await goto(update, context, V("allv"))
-        if text == BTN_FEMALE:
-            return await goto(update, context, V("vlist", g="f", p=0))
-        if text == BTN_MALE:
-            return await goto(update, context, V("vlist", g="m", p=0))
+        if text in (BTN_FEMALE, BTN_MALE):
+            g = "f" if text == BTN_FEMALE else "m"
+            if vn == "allv" and view.get("ar"):
+                return await goto(update, context, V("vlist", g=g, p=0, ar=1))
+            return await goto(update, context, V("vlist", g=g, p=0))
         if text == BTN_CREATE:
             return await goto(update, context, V("create", p=0))
         if text == BTN_CLONE:
@@ -1840,6 +1970,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in labels:
             v = labels[text]
             n = view.get("n")
+            if n == "vlist" and view.get("ar"):   # Auto Reply: এই ভয়েস দিয়েই বানানো হবে
+                return await ar_pick_voice(
+                    update, context, v,
+                    V("vlist", g=view.get("g", "f"), p=view.get("p", 0), ar=1),
+                )
             if n == "vlist":
                 added = await add_voice(st, {"id": v["id"], "name": v["name"], "kind": "lib"})
                 msg = f"✅ যোগ হয়েছে — {v['name']}" if added else f"ℹ️ আগেই যোগ করা আছে — {v['name']}"
@@ -1847,10 +1982,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if n == "create":
                 return await start_gen(update, context, v)
             if n == "argen":
-                return await ar_prompt(
-                    update, context, f"{PROMPT_AR_NAME}\n\n🧬 {v['name']}",
-                    {"t": "ar_name", "cvid": v["id"], "cname": v["name"], "back": V("argen", p=view.get("p", 0))},
-                )
+                return await ar_pick_voice(update, context, v, V("argen", p=view.get("p", 0)))
             if n == "arset":
                 return await ar_open(update, context, st, v)
             if n == "pick":   # রিস্টার্টের পর ভয়েসের তথ্য হারিয়ে গেলে
