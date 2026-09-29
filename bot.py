@@ -5,6 +5,7 @@ import difflib
 import unicodedata
 import math
 import time
+import types
 import random
 import shutil
 import asyncio
@@ -280,6 +281,50 @@ def _process_referral(new_uid: int, ref_uid: int, name, username) -> bool:
     return txn(db.transaction())
 
 
+# ---------- Link Protect (Firestore) ----------
+def _lp_get(cid: int):
+    snap = db.collection(LINK_PROT).document(str(cid)).get()
+    return (snap.to_dict() or {}) if snap.exists else None
+
+
+def _lp_save(cid: int, data: dict):
+    db.collection(LINK_PROT).document(str(cid)).set(data, merge=True)
+
+
+def _lp_field_del(cid: int, *paths):
+    db.collection(LINK_PROT).document(str(cid)).update({p: firestore.DELETE_FIELD for p in paths})
+
+
+def _lp_status(ids):
+    """গ্রুপ/চ্যানেল আইডি -> Link Protect চালু আছে কিনা"""
+    out = {}
+    refs = [db.collection(LINK_PROT).document(str(i)) for i in ids]
+    if not refs:
+        return out
+    for snap in db.get_all(refs):
+        if snap.exists:
+            out[int(snap.id)] = bool((snap.to_dict() or {}).get("on"))
+    return out
+
+
+def _lp_add_warn(cid: int, uid: int) -> int:
+    """ওয়ার্নিং কাউন্ট ১ বাড়িয়ে নতুন কাউন্ট ফেরত দেয় (Transaction, তাই গোলমাল হয় না)"""
+    ref = db.collection(LINK_PROT).document(str(cid))
+
+    @firestore.transactional
+    def txn(t):
+        d = ref.get(transaction=t).to_dict() or {}
+        n = int((d.get("warns") or {}).get(f"u{uid}", 0)) + 1
+        t.update(ref, {f"warns.u{uid}": n})
+        return n
+
+    return txn(db.transaction())
+
+
+def _lp_clear_warn(cid: int, uid: int):
+    db.collection(LINK_PROT).document(str(cid)).update({f"warns.u{uid}": firestore.DELETE_FIELD})
+
+
 # ---------------------------------------------------------------
 # বাটনের রঙ (টেলিগ্রাম শুধু 3টা রঙ সাপোর্ট করে)
 #   "primary" = নীল | "success" = সবুজ | "danger" = লাল
@@ -369,6 +414,42 @@ AR_COOLDOWN = 3         # একই গ্রুপে একই ভয়েস
 AR_TTL = 300            # গ্রুপের রুল ক্যাশ (সেকেন্ড)
 
 # ---------------------------------------------------------------
+# Link Protect (গ্রুপ/চ্যানেলে লিংক পাঠানো আটকানো)
+# ---------------------------------------------------------------
+LINK_PROT = "link_protect"   # প্রতি গ্রুপ/চ্যানেলের লিংক প্রটেক্ট সেটিংস
+BTN_LP_SET = "⚙️ Link Settings"
+BTN_LP_ON = "🟢 Link Protect: ON"
+BTN_LP_OFF = "🔴 Link Protect: OFF"
+BTN_LP_ALLOW = "🔑 Allowed Users"
+BTN_LP_WARN = "⚠️ Warning"
+BTN_LP_BAN = "🚫 Ban"
+BTN_LP_EDIT = "✏️ Change Message"
+BTN_LP_RESET = "♻️ Reset Default"
+BTN_LP_CNT = "🔢 Max Warnings"
+BTN_LP_PHOTO_ON = "🖼 Profile Photo: ON"
+BTN_LP_PHOTO_OFF = "🖼 Profile Photo: OFF"
+BTN_LP_TITLE = "📝 Warning Title"
+BTN_LP_SHOW = "✅ Show Photo"
+BTN_LP_HIDE = "🚫 No Photo"
+BTN_LP_TDEF = "📌 Default Title"
+BTN_LP_TCUS = "✍️ Custom Title"
+BTN_LP_GIVE = "➕ Give Permission"
+BTN_LP_PERM = "♾ Permanent"
+LP_DUR_QUICK = {"⏱ 1 Hour": 3600, "⏱ 1 Day": 86400, "⏱ 7 Days": 7 * 86400, "⏱ 30 Days": 30 * 86400}
+LP_DUR_MAX = 365 * 86400       # অনুমতির সর্বোচ্চ সময় (১ বছর)
+LP_VIEWS = ("lpc", "lp", "lps", "lpb", "lpw", "lpa", "lpq")
+LP_WARN_LIMIT = 20             # সর্বোচ্চ কতবার ওয়ার্নিং সেট করা যাবে
+LP_TTL = 120                   # গ্রুপের সেটিংস ক্যাশ (সেকেন্ড)
+LP_BAN_DEFAULT = (
+    "আমাদের চ্যানেলের রুলস ব্রেক করার জন্য {name} ({username}) — তাকে ব্যান করা হলো।\n\n"
+    "📌 রিজন: প্রোমোশনাল লিংক পাঠিয়েছেন।\n"
+    "দয়া করে কেউ চ্যানেলের লিংক ভঙ্গ করবেন না, ধন্যবাদ।"
+)
+LP_WARN_TITLE = "ওয়ার্নিং নোটিশ"
+ANON_ADMIN_ID = 1087968824     # GroupAnonymousBot (অ্যানোনিমাস অ্যাডমিন)
+CHANNEL_BOT_ID = 136817688     # Channel_Bot (চ্যানেল হয়ে গ্রুপে পাঠালে)
+
+# ---------------------------------------------------------------
 # অ্যাডমিন প্যানেল (/APDADMIN) — শুধু ADMIN_ID এর ইউজার ব্যবহার করতে পারবে
 # Render Environment এ ADMIN_ID দিন (আপনার টেলিগ্রাম নিউমেরিক ID, যেমন 123456789)
 # ADMIN_ID সেট না থাকলে কমান্ডটা কারো জন্যই কাজ করবে না (সাইলেন্ট)।
@@ -400,6 +481,9 @@ POWER_BTNS = (BTN_PW_ON, BTN_PW_OFF, BTN_PW_UPD)
 BTN_UPD_MANUAL = "🎛 Manual Update"          # ইচ্ছেমতো আপডেট মোড চালু/বন্ধ (নিজে না সরানো পর্যন্ত চলবে)
 BTN_UPD_TIMER = "⏱ Timer Update"            # সময় সেট করলে সময় শেষে অটো চালু
 BTN_UPD_LIVE = "✅ Update শেষ · সব চালু"     # আপডেট মোড সরিয়ে সব কার্যক্রম চালু
+BTN_UPD_PREVIEW = "👁 User Mode Preview"     # কিছুক্ষণের জন্য ইউজারের চোখে বট দেখা
+PV_QUICK = {"⏱ 2 মিনিট": 120, "⏱ 5 মিনিট": 300, "⏱ 10 মিনিট": 600}
+PV_MAX_SEC = 3600
 # --- Notice মেনু ---
 BTN_NT_USER = "👤 নির্দিষ্ট ইউজার"
 BTN_NT_ALL = "👥 সকল ইউজার (All)"
@@ -409,7 +493,7 @@ BTN_CMP_IMG = "🖼 ছবি সহ"
 BTN_CMP_POST = "✅ Post"
 BTN_CMP_SEND = "✅ Send Notice"
 BTN_CMP_CANCEL = "❌ Cancel"
-ADM_VIEWS = ("admin", "upd", "notice", "cmp")
+ADM_VIEWS = ("admin", "upd", "notice", "cmp", "pv")
 BCAST_RATE = int(os.environ.get("BCAST_RATE", 25))     # টেলিগ্রাম লিমিটের নিচে থাকতে প্রতি সেকেন্ডে সর্বোচ্চ কতটা মেসেজ/এডিট
 NOTICE_INLINE_MAX = 60   # এর বেশি ইউজারকে নোটিশ গেলে ব্যাকগ্রাউন্ডে যাবে
 UPD_MIN_SEC = 10
@@ -972,11 +1056,256 @@ async def refer_text(ctx) -> str:
 
 
 # ---------------------------------------------------------------
+# Link Protect মেনু রেন্ডার
+# ---------------------------------------------------------------
+def lp_active_allow(cfg, now):
+    """যাদের অনুমতি এখনো চালু আছে: [(uid, exp(0=পার্মানেন্ট), name)]"""
+    out = []
+    for k, e in (cfg.get("allow") or {}).items():
+        if not (isinstance(k, str) and k.startswith("u") and k[1:].isdigit() and isinstance(e, dict)):
+            continue
+        exp = float(e.get("exp") or 0)
+        if exp == 0 or exp > now:
+            out.append((int(k[1:]), exp, e.get("name")))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def lp_allowed(cfg, uid, now) -> bool:
+    e = (cfg.get("allow") or {}).get(f"u{uid}")
+    if not isinstance(e, dict):
+        return False
+    exp = float(e.get("exp") or 0)
+    return exp == 0 or exp > now
+
+
+def lp_action(cfg) -> str:
+    return cfg.get("action") if cfg.get("action") in ("ban", "warn") else "ban"
+
+
+def lp_warn_max(cfg) -> int:
+    try:
+        return min(max(int(cfg.get("warn_max") or 3), 1), LP_WARN_LIMIT)
+    except (TypeError, ValueError):
+        return 3
+
+
+async def render_lp(view, st):
+    n = view.get("n")
+    labels = {}
+    nav = [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]
+    if st is None:
+        raise RuntimeError("state নেই")
+
+    if n == "lpc":
+        try:
+            owned = await run(_get_owned_chats, st["uid"])
+        except Exception as e:
+            logging.warning("lp owned chats error: %s", e)
+            owned = []
+        try:
+            status = await run(_lp_status, [c["id"] for c in owned])
+        except Exception as e:
+            logging.warning("lp status error: %s", e)
+            status = {}
+        pages = max(1, math.ceil(len(owned) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for c in owned[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            on_ = status.get(c["id"], False)
+            pre = "🟢" if on_ else ("📢" if c["type"] == "channel" else "👥")
+            label = uniq_label(pre, c["title"], labels)
+            labels[label] = c
+            btns.append(B(label, "success" if on_ else DEFAULT_STYLE))
+        rows = pair(btns)
+        pn = page_nav(pg, pages)
+        if pn:
+            rows.append(pn)
+        rows.append(nav)
+        text = (
+            "🔗 Link Protect\n"
+            "যে গ্রুপ/চ্যানেলে লিংক প্রটেক্ট চালাতে চান সেটি বেছে নিন\n"
+            "অথবা গ্রুপ/চ্যানেলের ID বা @username লিখুন\n"
+            "🟢 = Link Protect চালু আছে"
+        )
+        if not owned:
+            text += "\n\n(কোনো গ্রুপ/চ্যানেল পাওয়া যায়নি — বটকে অ্যাডমিন বানান, অথবা ID লিখুন)"
+        elif pages > 1:
+            text += f"\n({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("lpc", p=pg)
+
+    cid = view.get("c")
+    cfg = await run(_lp_get, cid)
+    if cfg is None:
+        raise RuntimeError("গ্রুপ/চ্যানেল পাওয়া যায়নি")
+    title = cfg.get("title") or str(cid)
+    on = bool(cfg.get("on"))
+    action = lp_action(cfg)
+    mx = lp_warn_max(cfg)
+    photo = cfg.get("warn_photo", True) is not False
+    now = time.time()
+
+    if n == "lp":
+        allow = lp_active_allow(cfg, now)
+        act = "🚫 Ban (লিংক দিলেই সাথে সাথে)" if action == "ban" else f"⚠️ Warning ({mx} বার হলে Ban)"
+        text = (
+            f"🔗 Link Protect — {title}\n"
+            f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n"
+            f"শাস্তি: {act}\n"
+            f"🔑 লিংক দেওয়ার অনুমতি আছে: {len(allow)} জনের\n\n"
+            "ON থাকলে অনুমতি ছাড়া কেউ লিংক দিলে মেসেজ মুছে যাবে — চ্যানেল ওনার বা অ্যাডমিনও না।\n"
+            "বটকে Delete Messages ও Ban Users পারমিশন দিতে হবে।"
+        )
+        if cfg.get("type") == "channel":
+            text += (
+                "\n\nℹ️ চ্যানেলে কে পোস্ট করেছে বট জানতে পারে না, তাই সেখানে লিংকসহ পোস্ট মুছে যাবে "
+                "(Ban/Warning/অনুমতি কাজ করে না)। ইউজারদের জন্য চ্যানেলের ডিসকাশন গ্রুপেও চালু করুন।"
+            )
+        rows = [
+            [B(BTN_LP_SET)],
+            [B(BTN_LP_ON if on else BTN_LP_OFF, "success" if on else "danger")],
+            [B(BTN_LP_ALLOW)],
+            nav,
+        ]
+        return text, kb(rows), labels, V("lp", c=cid)
+
+    if n == "lps":
+        rows = [
+            [B(BTN_LP_WARN, "success" if action == "warn" else DEFAULT_STYLE),
+             B(BTN_LP_BAN, "success" if action == "ban" else DEFAULT_STYLE)],
+            nav,
+        ]
+        text = (
+            f"⚙️ Link Settings — {title}\n"
+            f"এখন চালু: {'🚫 Ban' if action == 'ban' else '⚠️ Warning'}\n\n"
+            "⚠️ Warning — লিংক দিলে ওয়ার্নিং, নির্দিষ্ট বার হলে Ban\n"
+            "🚫 Ban — লিংক দিলেই সাথে সাথে Ban"
+        )
+        return text, kb(rows), labels, V("lps", c=cid)
+
+    if n == "lpb":
+        custom = bool(cfg.get("ban_text"))
+        tpl = cfg.get("ban_text") or LP_BAN_DEFAULT
+        rows = [[B(BTN_LP_EDIT), B(BTN_LP_RESET)], nav]
+        text = (
+            f"🚫 Ban — {title}\n"
+            "কেউ লিংক পাঠালে সাথে সাথে Ban হবে এবং তার প্রোফাইল ছবিসহ এই নোটিশ পোস্ট হবে:\n\n"
+            f"{tpl}\n\n"
+            f"({'✏️ কাস্টম মেসেজ' if custom else '📌 ডিফল্ট মেসেজ'})\n"
+            "{name} = টেলিগ্রাম নাম, {username} = আন্ডারলাইন করা ইউজারনেম, {id} = TG ID"
+        )
+        return text, kb(rows), labels, V("lpb", c=cid)
+
+    if n == "lpw":
+        wt = cfg.get("warn_title")
+        rows = [
+            [B(BTN_LP_CNT), B(BTN_LP_PHOTO_ON if photo else BTN_LP_PHOTO_OFF, "success" if photo else "danger")],
+            [B(BTN_LP_TITLE), B(BTN_LP_RESET)],
+            nav,
+        ]
+        text = (
+            f"⚠️ Warning — {title}\n\n"
+            f"🔢 কতবার ওয়ার্নিং হলে Ban: {mx} বার\n"
+            f"🖼 প্রোফাইল ছবি: {'দেখাবে' if photo else 'দেখাবে না'}\n"
+            f"📝 টাইটেল: {wt or LP_WARN_TITLE} ({'কাস্টম' if wt else 'ডিফল্ট'})\n\n"
+            "নোটিশের নমুনা:\n"
+            f"⚠️ {wt or LP_WARN_TITLE}\n"
+            "👤 টেলিগ্রাম নাম (@username)\n"
+            "🆔 TG ID\n"
+            f"📊 ওয়ার্নিং: 1/{mx}\n"
+            "🚫 এখানে লিংক পাঠানো নিষেধ! ..."
+        )
+        return text, kb(rows), labels, V("lpw", c=cid)
+
+    if n == "lpa":
+        allow = lp_active_allow(cfg, now)
+        pages = max(1, math.ceil(len(allow) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns, lines = [], []
+        for uid, exp, name in allow[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            label = uniq_label("❌", f"{uid} {name or ''}".strip(), labels)
+            labels[label] = {"uid": uid}
+            btns.append(B(label))
+            when = "♾ পার্মানেন্ট" if not exp else f"⏱ বাকি {fmt_left(exp - now)}"
+            lines.append(f"• {uid}{' — ' + name if name else ''} — {when}")
+        rows = [[B(BTN_LP_GIVE, "success")]] + pair(btns)
+        pn = page_nav(pg, pages)
+        if pn:
+            rows.append(pn)
+        rows.append(nav)
+        text = (
+            f"🔑 Allowed Users — {title}\n"
+            "শুধু এদের লিংক দেওয়ার অনুমতি আছে — বাকি কেউ পারবে না (চ্যানেল ওনার ও আপনিও না)\n"
+        )
+        if lines:
+            text += "\n" + "\n".join(lines) + "\n\nঅনুমতি বাতিল করতে নিচে ❌ বাটনে ট্যাপ করুন"
+            if pages > 1:
+                text += f" ({pg + 1}/{pages})"
+        else:
+            text += "\n(এখনো কাউকে অনুমতি দেওয়া হয়নি)"
+        return text, kb(rows), labels, V("lpa", c=cid, p=pg)
+
+    if n == "lpq":
+        s_ = view.get("s")
+        w_ = 1 if view.get("w") else 0
+        u_ = view.get("u")
+        if s_ == "cnt":
+            text = (
+                f"🔢 কতবার ওয়ার্নিং হলে Ban করা হবে?\nসংখ্যা লিখুন (১–{LP_WARN_LIMIT}) অথবা বাটন চাপুন\n"
+                f"এখন: {mx} বার"
+            )
+            rows = [[B("1"), B("2"), B("3"), B("5")], nav]
+        elif s_ == "photo":
+            text = "🖼 ওয়ার্নিং নোটিশে ইউজারের প্রোফাইল ফোটো দেখাবে?"
+            rows = [[B(BTN_LP_SHOW, "success"), B(BTN_LP_HIDE, "danger")], nav]
+        elif s_ == "title":
+            text = (
+                "📝 ওয়ার্নিং নোটিশের টাইটেল কী হবে?\n"
+                f"ডিফল্ট টাইটেল: {LP_WARN_TITLE}\n\n"
+                "ডিফল্ট রাখবেন নাকি নিজের ইচ্ছেমতো দেবেন?"
+            )
+            rows = [[B(BTN_LP_TDEF), B(BTN_LP_TCUS)], nav]
+        elif s_ == "titletxt":
+            text = "✍️ আপনার পছন্দের টাইটেল লিখুন (সর্বোচ্চ ৬০ অক্ষর)"
+            rows = [nav]
+        elif s_ == "bantxt":
+            text = (
+                "✏️ নতুন Ban মেসেজ লিখুন\n\n"
+                "এগুলো ব্যবহার করতে পারবেন:\n"
+                "{name} = টেলিগ্রাম নাম\n{username} = আন্ডারলাইন করা ইউজারনেম\n{id} = TG ID\n\n"
+                f"এখনকার মেসেজ:\n{cfg.get('ban_text') or LP_BAN_DEFAULT}"
+            )
+            rows = [nav]
+        elif s_ == "aid":
+            text = (
+                "🆔 যাকে লিংক দেওয়ার অনুমতি দিতে চান তার TG ID দিন\n"
+                "(শুধু সংখ্যা। @username দিলে ইউজারকে আগে এই বটে /start দিতে হবে)"
+            )
+            rows = [nav]
+        elif s_ == "adur":
+            text = (
+                f"⏱ {u_} কে কতক্ষণের জন্য অনুমতি দেবেন?\n"
+                "বাটন চাপুন অথবা নিজে লিখুন (যেমন: 2h, 3d, 1d12h)\n"
+                "(কমপক্ষে ১ মিনিট, সর্বোচ্চ ৩৬৫ দিন)"
+            )
+            q = list(LP_DUR_QUICK)
+            rows = [[B(BTN_LP_PERM, "success")], [B(q[0]), B(q[1])], [B(q[2]), B(q[3])], nav]
+        else:
+            raise RuntimeError("অজানা ধাপ")
+        return text, kb(rows), labels, V("lpq", s=s_, c=cid, w=w_, u=u_)
+
+    raise RuntimeError("অজানা মেনু")
+
+
+# ---------------------------------------------------------------
 # মেনু রেন্ডার: (টেক্সট, কীবোর্ড, লেবেল→ভয়েস, ঠিক করা ভিউ)
 # ---------------------------------------------------------------
 async def render(view, st=None, ctx=None):
     n = view.get("n")
     labels = {}
+
+    if n in LP_VIEWS:
+        return await render_lp(view, st)
 
     if n == "refer":
         text = await refer_text(ctx) if ctx else ""
@@ -999,7 +1328,7 @@ async def render(view, st=None, ctx=None):
         text = f"🛡 ADMIN PANEL\n{status_line()}\nআপনার পছন্দের অপশনটি বেছে নিন"
         return text, kb(rows), labels, V("admin")
 
-    if n in ("upd", "notice", "cmp"):
+    if n in ("upd", "notice", "cmp", "pv"):
         # নিরাপত্তা: অ্যাডমিন ছাড়া কেউ এই মেনু দেখতে পাবে না
         if not ctx or not is_admin(ctx["user"].id):
             return menu_text(1), main_keyboard(1), labels, MAIN1
@@ -1007,14 +1336,24 @@ async def render(view, st=None, ctx=None):
             rows = []
             if _BS["state"] == "update":
                 rows.append([B(BTN_UPD_LIVE, "success")])
-            rows += [[B(BTN_UPD_MANUAL)], [B(BTN_UPD_TIMER)], [B(BTN_HOME, NAV_STYLE)]]
+            rows += [[B(BTN_UPD_MANUAL)], [B(BTN_UPD_TIMER)], [B(BTN_UPD_PREVIEW)], [B(BTN_HOME, NAV_STYLE)]]
             text = (
                 "🛠 Bot Update Mode\n"
                 f"{status_line()}\n\n"
                 "🎛 Manual Update — নিজে বন্ধ না করা পর্যন্ত আপডেট মোড চলবে\n"
-                "⏱ Timer Update — সময় শেষে বট অটো চালু হবে"
+                "⏱ Timer Update — সময় শেষে বট অটো চালু হবে\n"
+                "👁 User Mode Preview — কিছুক্ষণ ইউজারের চোখে বট দেখুন"
             )
             return text, kb(rows), labels, V("upd")
+        if n == "pv":
+            rows = [[B(t) for t in PV_QUICK], [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
+            text = (
+                "👁 User Mode Preview\n"
+                f"{status_line()}\n\n"
+                "কতক্ষণ ইউজার মোডে থাকবেন? বাটন চাপুন অথবা নিজে লিখুন (যেমন 3m, 90s, 30m)\n"
+                "সর্বোচ্চ ১ ঘন্টা। বের হতে চাইলে /apdadmin দিন বা ❌ বাটন চাপুন"
+            )
+            return text, kb(rows), labels, V("pv")
         if n == "notice":
             rows = [[B(BTN_NT_USER), B(BTN_NT_ALL)], [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
             return "📢 Notice\nকাকে নোটিশ পাঠাবেন?", kb(rows), labels, V("notice")
@@ -1441,7 +1780,7 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
     chat_id = update.effective_chat.id
     user = update.effective_user
     st = context.bot_data.setdefault("state", {}).get(chat_id)
-    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS:
+    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS + LP_VIEWS:
         st = await get_state(context, user.id, chat_id)
     try:
         rtext, markup, labels, view = await render(
@@ -1453,6 +1792,8 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
             fb, err = MAIN1, "❌ রেফার পেজ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("n") in AR_VIEWS:
             fb, err = V("ar"), "❌ লোড হয়নি, আবার চেষ্টা করুন"
+        elif view.get("n") in LP_VIEWS:
+            fb, err = V("main", p=2), "❌ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("ar"):   # Auto Reply এর Browse All Voices লোড না হলে
             fb, err = V("ar"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         else:
@@ -1658,7 +1999,7 @@ CMP_TITLES = {
     "na": "📢 Notice → সকল ইউজার",
     "nu": "📢 Notice → নির্দিষ্ট ইউজার",
 }
-_BS = {"state": "on", "until": 0.0, "cd": None, "tok": 0, "editing": False}
+_BS = {"state": "on", "until": 0.0, "cd": None, "tok": 0, "editing": False, "pv": {}, "post": None}
 _BS_LOCK = None   # post_init এ তৈরি হয়
 _BN = str.maketrans("0123456789", "০১২৩৪৫৬৭৮৯")
 _EN = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
@@ -1737,7 +2078,7 @@ _TIME_RE = re.compile(
 )
 
 
-def parse_duration(raw: str):
+def parse_duration(raw: str, lo: int = UPD_MIN_SEC, hi: int = UPD_MAX_SEC):
     """'1h30m', '45s', '২ ঘন্টা ১০ মিনিট' -> সেকেন্ড। ভুল হলে None"""
     t = (raw or "").strip().lower().translate(_EN)
     found = _TIME_RE.findall(t)
@@ -1750,7 +2091,7 @@ def parse_duration(raw: str):
         u = unit[0]
         mult = {"d": 86400, "দ": 86400, "h": 3600, "ঘ": 3600, "m": 60, "ম": 60, "s": 1, "স": 1}[u]
         total += int(num) * mult
-    if total < UPD_MIN_SEC or total > UPD_MAX_SEC:
+    if total < lo or total > hi:
         return None
     return total
 
@@ -1875,10 +2216,10 @@ async def set_power(app, on: bool) -> str:
         old = _BS["state"]
         cd = _BS["cd"]
         msgs = list(cd["msgs"]) if cd else []
-        _BS.update(state="on" if on else "off", until=0.0, cd=None)
+        _BS.update(state="on" if on else "off", until=0.0, cd=None, post=None)
         _BS["tok"] += 1
         try:
-            await run(_bs_save, {"state": _BS["state"], "until": 0.0})
+            await run(_bs_save, {"state": _BS["state"], "until": 0.0, "post": None})
             await run(_cd_save, [])
         except Exception as e:
             logging.warning("bot state save error: %s", e)
@@ -1889,13 +2230,13 @@ async def set_power(app, on: bool) -> str:
     return old
 
 
-async def set_update(app, until: float) -> int:
+async def set_update(app, until: float, post=None) -> int:
     async with _BS_LOCK:
-        _BS.update(state="update", until=until, cd=None)
+        _BS.update(state="update", until=until, cd=None, post=post)
         _BS["tok"] += 1
         tok = _BS["tok"]
         try:
-            await run(_bs_save, {"state": "update", "until": until})
+            await run(_bs_save, {"state": "update", "until": until, "post": post})
             await run(_cd_save, [])
         except Exception as e:
             logging.warning("bot state save error: %s", e)
@@ -2019,9 +2360,12 @@ async def countdown_loop(app):
     while True:
         await asyncio.sleep(1)
         try:
+            now = time.time()
+            for aid, pv_ in list(_BS["pv"].items()):
+                if now >= pv_["until"]:
+                    await end_preview(app, aid, "⏱ User Mode সময় শেষ — আবার অ্যাডমিন মোডে")
             if _BS["state"] != "update" or not _BS["until"]:
                 continue
-            now = time.time()
             if now >= _BS["until"]:
                 await end_update(app)
                 continue
@@ -2034,6 +2378,68 @@ async def countdown_loop(app):
                     spawn(_cd_tick(app))
         except Exception:
             logging.exception("countdown loop error")
+
+
+# ---------- User Mode Preview: অ্যাডমিন কিছুক্ষণ ইউজারের চোখে বট দেখে ----------
+async def start_preview(update, context, st, secs: int):
+    app, bot = context.application, context.bot
+    aid = update.effective_user.id
+    until = time.time() + secs
+    _BS["pv"][aid] = {"until": until, "banner": None}
+    old = st.get("msg")
+    if update.message:
+        spawn(safe_delete(bot, aid, update.message.message_id))
+    if old:
+        spawn(safe_delete(bot, aid, old))
+    st.update(view=MAIN1, mode=None, labels=None, msg=None)
+    await _rm_kb(bot, aid)
+    if _BS["state"] == "on":   # চালু থাকলে ইউজার যা দেখে: মেইন মেনু
+        await bot.send_message(aid, menu_text(1), reply_markup=main_keyboard(1))
+    post = _BS.get("post")
+    if _BS["state"] == "update" and post:   # আপডেট পোস্ট যেমন ইউজাররা দেখছে
+        markup = cd_markup(_BS["until"] - time.time()) if (post.get("timer") and _BS["until"]) else None
+        mid = await send_post(bot, aid, post.get("photo"), post.get("html") or "", markup)
+        cd = _BS.get("cd")
+        if markup and cd is not None:
+            cd["msgs"].append((aid, mid))
+    banner = await bot.send_message(
+        aid,
+        f"👁 User Mode চালু — {fmt_left(secs)}\n{status_line()}\n\nএখন আপনি ঠিক ইউজারের মতো দেখছেন। বের হতে নিচের বাটন বা /apdadmin",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Preview বন্ধ করুন", callback_data="pv_end")]]),
+    )
+    _BS["pv"][aid]["banner"] = banner.message_id
+
+
+async def end_preview(app, aid: int, notice: str) -> bool:
+    pv = _BS["pv"].pop(aid, None)
+    if not pv:
+        return False
+    bot = app.bot
+    if pv.get("banner"):
+        try:
+            await bot.edit_message_text("✅ User Mode Preview শেষ", chat_id=aid, message_id=pv["banner"])
+        except TelegramError:
+            pass
+    text, markup, _, view = await render(V("admin"), None, {"user": types.SimpleNamespace(id=aid), "bot": None})
+    m = await bot.send_message(aid, f"{notice}\n\n{text}", reply_markup=markup)
+    stc = app.bot_data.get("state", {}).get(aid)
+    if stc is not None:
+        stc.update(view=view, mode=None, labels=None, msg=m.message_id)
+    try:
+        await run(lambda: db.collection(USERS).document(str(aid)).set({"view": view, "last_msg_id": m.message_id}, merge=True))
+    except Exception as e:
+        logging.warning("preview end save error: %s", e)
+    return True
+
+
+async def on_pv_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+    if update.effective_user and is_admin(update.effective_user.id):
+        await end_preview(context.application, update.effective_user.id, "🛡 User Mode বন্ধ করা হয়েছে")
 
 
 # ---------- অ্যাডমিন মেনু: বাটন/টেক্সট হ্যান্ডলিং ----------
@@ -2056,6 +2462,8 @@ async def adm_back(update, context, st, view):
     vn = view.get("n")
     if vn in ("upd", "notice"):
         return await goto(update, context, V("admin"))
+    if vn == "pv":
+        return await goto(update, context, V("upd"))
     mode = st.get("mode")
     if vn != "cmp" or not mode or mode.get("t") != "cmp":
         return await goto(update, context, V("admin"))
@@ -2105,7 +2513,7 @@ async def cmp_execute(update, context, st, mode):
     # আপডেট পোস্ট
     timer = k == "ut"
     until = time.time() + mode["secs"] if timer else 0.0
-    tok = await set_update(app, until)          # আগে আপডেট মোড চালু, তারপর পোস্ট
+    tok = await set_update(app, until, {"photo": photo, "html": html, "timer": timer})   # আগে আপডেট মোড চালু, তারপর পোস্ট
     spawn(update_job(app, tok, photo, html, timer))
     await cmp_cleanup(context, chat_id, st)
     extra = "🛠 আপডেট মোড চালু হয়েছে — পোস্ট সবার কাছে যাচ্ছে"
@@ -2150,7 +2558,18 @@ async def admin_text(update, context, st, view, text: str) -> bool:
         if text == BTN_UPD_TIMER:
             await goto(update, context, V("cmp", s="time", k="ut"), mode={"t": "cmp", "k": "ut"})
             return True
+        if text == BTN_UPD_PREVIEW:
+            await goto(update, context, V("pv"))
+            return True
         return False
+
+    if vn == "pv":
+        secs = PV_QUICK.get(text) or parse_duration(text)
+        if secs is None or secs > PV_MAX_SEC:
+            await goto(update, context, V("pv"), extra="❌ সময় বোঝা যায়নি — যেমন: 3m, 90s (সর্বোচ্চ 1h)")
+            return True
+        await start_preview(update, context, st, secs)
+        return True
 
     if vn == "notice":
         if text == BTN_NT_ALL:
@@ -2246,12 +2665,26 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """বট OFF বা UPDATE মোডে থাকলে ইউজারের সব মেসেজ/বাটন চুপচাপ বন্ধ (মেসেজ মুছে যায়)।
     অ্যাডমিন কখনো আটকায় না।"""
     user = update.effective_user
-    if user is None or is_admin(user.id) or _BS["state"] == "on":
+    if user is None:
         return
     chat = update.effective_chat
     if chat is not None and chat.type != "private":
         return
     q = update.callback_query
+    pv = is_admin(user.id) and user.id in _BS["pv"]
+    if pv:
+        # User Mode Preview চলছে: অ্যাডমিন ইউজারের মতোই আটকাবে, শুধু বের হওয়ার পথ খোলা
+        if q is not None and q.data == "pv_end":
+            return
+        m0 = update.effective_message
+        if q is None and m0 is not None and (m0.text or "").strip().lower().split("@")[0] == "/apdadmin":
+            spawn(safe_delete(context.bot, chat.id, m0.message_id))
+            await end_preview(context.application, user.id, "🛡 User Mode বন্ধ করা হয়েছে")
+            raise ApplicationHandlerStop
+        if _BS["state"] == "on":
+            return
+    elif is_admin(user.id) or _BS["state"] == "on":
+        return
     if q is not None:
         try:
             await q.answer(cd_alert() if q.data == "cd" else None)
@@ -2583,6 +3016,429 @@ async def avdel_action(update, context, st, view, text: str):
 
 
 # ---------------------------------------------------------------
+# Link Protect — মেনুর বাটন/লেখা
+# ---------------------------------------------------------------
+_LP_CACHE = {}
+_lp_recent = {}   # (chat, user) -> শেষ যে সময়ে শাস্তি দেওয়া হয়েছে (একসাথে অনেক লিংকে বারবার ওয়ার্নিং না দিতে)
+_LINK_RE = re.compile(r"(?:https?://|www\.|(?:t|telegram)\.(?:me|dog)/|tg://)\S+", re.I)
+
+
+def lp_invalidate(cid=None):
+    if cid is None:
+        _LP_CACHE.clear()
+    else:
+        _LP_CACHE.pop(cid, None)
+
+
+async def lp_cfg(cid: int):
+    hit = _LP_CACHE.get(cid)
+    if hit and time.time() - hit[0] < LP_TTL:
+        return hit[1]
+    cfg = await run(_lp_get, cid)
+    if len(_LP_CACHE) > 3000:
+        _LP_CACHE.clear()
+    _LP_CACHE[cid] = (time.time(), cfg)
+    return cfg
+
+
+async def lp_save(cid: int, data: dict):
+    await run(_lp_save, cid, data)
+    lp_invalidate(cid)
+
+
+async def lp_perm_note(bot, cid, ctype) -> str:
+    """বটের দরকারি পারমিশন না থাকলে সতর্কবার্তা"""
+    try:
+        bm = await bot.get_chat_member(cid, bot.id)
+    except TelegramError:
+        return "⚠️ বটের পারমিশন যাচাই করা যায়নি"
+    if bm.status != "administrator":
+        return "⚠️ বট এখানে অ্যাডমিন নয় — আগে বটকে অ্যাডমিন বানান"
+    miss = []
+    if not getattr(bm, "can_delete_messages", False):
+        miss.append("Delete Messages")
+    if ctype != "channel" and not getattr(bm, "can_restrict_members", False):
+        miss.append("Ban Users")
+    return ("⚠️ বটকে এই পারমিশন দিন: " + ", ".join(miss)) if miss else ""
+
+
+async def lp_open(update, context, cid, title, ctype):
+    """বাছাই করা গ্রুপ/চ্যানেলের Link Protect মেনু খোলে (আগে যাচাই: ইউজার অ্যাডমিন কিনা)"""
+    user = update.effective_user
+    back = V("lpc", p=0)
+    try:
+        m = await context.bot.get_chat_member(cid, user.id)
+    except TelegramError as e:
+        logging.warning("lp open member error: %s", e)
+        return await goto(update, context, back,
+                          extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+    if m.status not in ("creator", "administrator"):
+        return await goto(update, context, back, extra="❌ আপনি ওই গ্রুপ/চ্যানেলের অ্যাডমিন নন")
+    try:
+        await lp_save(cid, {"title": title, "type": ctype})
+    except Exception as e:
+        logging.warning("lp save error: %s", e)
+        return await goto(update, context, back, extra="❌ সেভ হয়নি, আবার চেষ্টা করুন")
+    note = await lp_perm_note(context.bot, cid, ctype)
+    return await goto(update, context, V("lp", c=cid), extra=note or None)
+
+
+async def lp_back(update, context, view):
+    n, c = view.get("n"), view.get("c")
+    if n == "lpc":
+        return await goto(update, context, V("main", p=2))
+    if n == "lp":
+        return await goto(update, context, V("lpc", p=0))
+    if n in ("lps", "lpa"):
+        return await goto(update, context, V("lp", c=c))
+    if n in ("lpb", "lpw"):
+        return await goto(update, context, V("lps", c=c))
+    s_ = view.get("s")   # lpq
+    if s_ == "bantxt":
+        return await goto(update, context, V("lpb", c=c))
+    if s_ in ("aid", "adur"):
+        return await goto(update, context, V("lpa", c=c, p=0))
+    return await goto(update, context, V("lps", c=c) if view.get("w") else V("lpw", c=c))
+
+
+async def lp_text(update, context, st, view, text: str) -> bool:
+    """Link Protect মেনুর সব বাটন ও লেখা। এই মেনুগুলোতে থাকলে সবসময় True (অন্য কিছু চলবে না)"""
+    n = view.get("n")
+    cid = view.get("c")
+    now = time.time()
+
+    def go(v, **kw):
+        return goto(update, context, v, **kw)
+
+    async def labels_of():
+        lb = st["labels"]
+        if lb is None:
+            try:
+                _, _, lb, _ = await render(view, st)
+            except Exception as e:
+                logging.warning("lp labels rebuild error: %s", e)
+                lb = {}
+            st["labels"] = lb
+        return lb
+
+    # ---------- গ্রুপ/চ্যানেল বাছাই ----------
+    if n == "lpc":
+        c = (await labels_of()).get(text)
+        if c:
+            await lp_open(update, context, c["id"], c["title"], c["type"])
+            return True
+        target = text.strip()
+        if re.fullmatch(r"-?\d+", target):
+            ref = int(target)
+        elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", target):
+            ref = "@" + target.lstrip("@")
+        else:
+            await go(V("lpc", p=view.get("p", 0)), extra="❌ ID বা @username সঠিক নয়")
+            return True
+        try:
+            ch = await context.bot.get_chat(ref)
+        except TelegramError as e:
+            logging.warning("lp chat lookup error: %s", e)
+            await go(V("lpc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+            return True
+        if ch.type not in ("group", "supergroup", "channel"):
+            await go(V("lpc", p=0), extra="❌ এটা গ্রুপ/চ্যানেল নয়")
+            return True
+        await lp_open(update, context, ch.id, ch.title or str(ch.id), ch.type)
+        return True
+
+    cfg = await run(_lp_get, cid)
+    if cfg is None:
+        await go(V("lpc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি")
+        return True
+
+    # ---------- মেইন মেনু: Link Settings | ON/OFF | Allowed Users ----------
+    if n == "lp":
+        if text == BTN_LP_SET:
+            await go(V("lps", c=cid))
+        elif text in (BTN_LP_ON, BTN_LP_OFF):
+            now_on = not cfg.get("on")
+            await lp_save(cid, {"on": now_on})
+            msg = "🟢 Link Protect চালু হয়েছে" if now_on else "🔴 Link Protect বন্ধ হয়েছে"
+            if now_on:
+                note = await lp_perm_note(context.bot, cid, cfg.get("type"))
+                if note:
+                    msg += "\n" + note
+            await go(V("lp", c=cid), extra=msg)
+        elif text == BTN_LP_ALLOW:
+            await go(V("lpa", c=cid, p=0))
+        return True
+
+    # ---------- Link Settings: Warning | Ban ----------
+    if n == "lps":
+        if text == BTN_LP_BAN:
+            await lp_save(cid, {"action": "ban"})
+            await go(V("lpb", c=cid), extra="🚫 Ban চালু হয়েছে")
+        elif text == BTN_LP_WARN:
+            await lp_save(cid, {"action": "warn"})
+            if cfg.get("warn_setup"):
+                await go(V("lpw", c=cid), extra="⚠️ Warning চালু হয়েছে")
+            else:
+                await go(V("lpq", s="cnt", c=cid, w=1), extra="⚠️ Warning চালু হয়েছে — এবার সেটিংস ঠিক করে নিন")
+        return True
+
+    # ---------- Ban মেসেজ ----------
+    if n == "lpb":
+        if text == BTN_LP_EDIT:
+            await go(V("lpq", s="bantxt", c=cid))
+        elif text == BTN_LP_RESET:
+            await lp_save(cid, {"ban_text": None})
+            await go(V("lpb", c=cid), extra="♻️ ডিফল্ট মেসেজ ফিরিয়ে আনা হয়েছে")
+        return True
+
+    # ---------- Warning সেটিংস ----------
+    if n == "lpw":
+        if text == BTN_LP_CNT:
+            await go(V("lpq", s="cnt", c=cid, w=0))
+        elif text in (BTN_LP_PHOTO_ON, BTN_LP_PHOTO_OFF):
+            new = cfg.get("warn_photo", True) is False
+            await lp_save(cid, {"warn_photo": new})
+            await go(V("lpw", c=cid), extra="🖼 প্রোফাইল ছবি চালু হয়েছে" if new else "🖼 প্রোফাইল ছবি বন্ধ হয়েছে")
+        elif text == BTN_LP_TITLE:
+            await go(V("lpq", s="title", c=cid, w=0))
+        elif text == BTN_LP_RESET:
+            await lp_save(cid, {"warn_max": 3, "warn_photo": True, "warn_title": None})
+            await go(V("lpw", c=cid), extra="♻️ ডিফল্ট সেটিংস ফিরিয়ে আনা হয়েছে")
+        return True
+
+    # ---------- Allowed Users ----------
+    if n == "lpa":
+        if text == BTN_LP_GIVE:
+            await go(V("lpq", s="aid", c=cid))
+        else:
+            it = (await labels_of()).get(text)
+            if it and it.get("uid"):
+                try:
+                    await run(_lp_field_del, cid, f"allow.u{it['uid']}")
+                except Exception as e:
+                    logging.warning("lp revoke error: %s", e)
+                lp_invalidate(cid)
+                await go(V("lpa", c=cid, p=0), extra=f"➖ {it['uid']} এর অনুমতি বাতিল হয়েছে")
+        return True
+
+    # ---------- ধাপে ধাপে প্রশ্ন / লেখা নেওয়া ----------
+    if n == "lpq":
+        s_ = view.get("s")
+        w_ = 1 if view.get("w") else 0
+
+        def again(msg, **kw):
+            return go(V("lpq", s=s_, c=cid, w=w_, u=view.get("u")), extra=msg)
+
+        async def warn_done(msg):
+            if w_:
+                await lp_save(cid, {"warn_setup": True})
+                msg = "✅ Warning সেটআপ শেষ"
+            return await go(V("lpw", c=cid), extra=msg)
+
+        if s_ == "cnt":
+            t = text.strip().translate(_EN)
+            if not t.isdigit() or not (1 <= int(t) <= LP_WARN_LIMIT):
+                await again(f"❌ ১ থেকে {LP_WARN_LIMIT} এর মধ্যে একটা সংখ্যা দিন")
+                return True
+            await lp_save(cid, {"warn_max": int(t)})
+            if w_:
+                await go(V("lpq", s="photo", c=cid, w=1), extra=f"✅ {int(t)} বার ওয়ার্নিং হলে Ban হবে")
+            else:
+                await go(V("lpw", c=cid), extra=f"✅ এখন থেকে {int(t)} বার ওয়ার্নিং হলে Ban হবে")
+            return True
+        if s_ == "photo":
+            if text not in (BTN_LP_SHOW, BTN_LP_HIDE):
+                return True
+            show = text == BTN_LP_SHOW
+            await lp_save(cid, {"warn_photo": show})
+            msg = "✅ প্রোফাইল ছবি দেখাবে" if show else "✅ প্রোফাইল ছবি দেখাবে না"
+            if w_:
+                await go(V("lpq", s="title", c=cid, w=1), extra=msg)
+            else:
+                await go(V("lpw", c=cid), extra=msg)
+            return True
+        if s_ == "title":
+            if text == BTN_LP_TDEF:
+                await lp_save(cid, {"warn_title": None})
+                await warn_done("✅ ডিফল্ট টাইটেল সেট হয়েছে")
+            elif text == BTN_LP_TCUS:
+                await go(V("lpq", s="titletxt", c=cid, w=w_))
+            return True
+        if s_ == "titletxt":
+            t = text.strip()
+            if not t or len(t) > 60:
+                await again("❌ টাইটেল ১ থেকে ৬০ অক্ষরের মধ্যে হতে হবে")
+                return True
+            await lp_save(cid, {"warn_title": t})
+            await warn_done("✅ টাইটেল সেট হয়েছে")
+            return True
+        if s_ == "bantxt":
+            t = text.strip()
+            if not t or len(t) > 700:
+                await again("❌ মেসেজ ১ থেকে ৭০০ অক্ষরের মধ্যে হতে হবে")
+                return True
+            await lp_save(cid, {"ban_text": t})
+            await go(V("lpb", c=cid), extra="✅ Ban মেসেজ বদলানো হয়েছে")
+            return True
+        if s_ == "aid":
+            t = text.strip()
+            tn = t.translate(_EN)
+            uid = None
+            if re.fullmatch(r"\d{4,15}", tn):
+                uid = int(tn)
+            elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", t):
+                uid = await run(_find_uid, t.lstrip("@"))
+            if not uid:
+                await again("❌ সঠিক TG ID দিন (শুধু সংখ্যা)\n@username দিলে ইউজারকে আগে এই বটে /start দিতে হবে")
+                return True
+            await go(V("lpq", s="adur", c=cid, u=uid), extra=f"🆔 {uid}")
+            return True
+        if s_ == "adur":
+            uid = view.get("u")
+            if text == BTN_LP_PERM:
+                secs = 0
+            elif text in LP_DUR_QUICK:
+                secs = LP_DUR_QUICK[text]
+            else:
+                secs = parse_duration(text, 60, LP_DUR_MAX)
+                if secs is None:
+                    await again("❌ সময় বোঝা যায়নি (যেমন: 2h, 3d, 1d12h)")
+                    return True
+            name = None
+            try:
+                mem = await context.bot.get_chat_member(cid, uid)
+                name = mem.user.full_name
+            except TelegramError:
+                pass
+            await lp_save(cid, {"allow": {f"u{uid}": {"exp": (now + secs) if secs else 0, "name": name, "at": now}}})
+            when = "♾ পার্মানেন্ট" if not secs else f"⏱ {fmt_left(secs)} এর জন্য"
+            await go(V("lpa", c=cid, p=0), extra=f"✅ {uid} কে লিংক দেওয়ার অনুমতি দেওয়া হলো ({when})")
+            return True
+    return True
+
+
+# ---------------------------------------------------------------
+# Link Protect — গ্রুপ/চ্যানেলে লিংক ধরা ও শাস্তি
+# ---------------------------------------------------------------
+def has_link(msg) -> bool:
+    for ents in (msg.entities, msg.caption_entities):
+        for e in ents or ():
+            if e.type in ("url", "text_link"):
+                return True
+    return bool(_LINK_RE.search(msg.text or msg.caption or ""))
+
+
+def lp_user_bits(fu):
+    name = h_esc(fu.full_name or "User")
+    mention = f'<a href="tg://user?id={fu.id}">{name}</a>'
+    uname = f"<u>@{h_esc(fu.username)}</u>" if fu.username else f"<u>{fu.id}</u>"
+    return mention, uname
+
+
+def lp_render_ban(tpl: str, fu) -> str:
+    mention, uname = lp_user_bits(fu)
+    return (h_esc(tpl).replace("{name}", mention)
+            .replace("{username}", uname).replace("{id}", f"<code>{fu.id}</code>"))
+
+
+async def lp_send(bot, chat_id: int, uid: int, html: str, photo: bool = True):
+    """প্রোফাইল ছবিসহ (না থাকলে শুধু লেখা) নোটিশ পোস্ট করে"""
+    fid = None
+    if photo:
+        try:
+            ph = await bot.get_user_profile_photos(uid, limit=1)
+            if ph.total_count and ph.photos:
+                fid = ph.photos[0][-1].file_id
+        except TelegramError as e:
+            logging.info("lp profile photo error: %s", e)
+    try:
+        if fid:
+            await bot.send_photo(chat_id, fid, caption=html, parse_mode="HTML")
+            return
+    except TelegramError as e:
+        logging.info("lp photo notice error: %s", e)
+    try:
+        await bot.send_message(chat_id, html, parse_mode="HTML",
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except TelegramError as e:
+        logging.warning("link protect notice error (%s): %s", chat_id, e)
+
+
+async def lp_ban(bot, chat_id: int, fu, cfg):
+    try:
+        await bot.ban_chat_member(chat_id, fu.id)
+    except TelegramError as e:
+        # ওনার/অ্যাডমিনকে বা বটের পারমিশন না থাকলে Ban হয় না — শুধু মেসেজ মোছা হয়
+        logging.warning("link protect ban error (%s/%s): %s", chat_id, fu.id, e)
+        return False
+    await lp_send(bot, chat_id, fu.id, lp_render_ban(cfg.get("ban_text") or LP_BAN_DEFAULT, fu), photo=True)
+    return True
+
+
+async def lp_warn(bot, chat_id: int, fu, cfg, n: int, mx: int):
+    mention, uname = lp_user_bits(fu)
+    html = (
+        f"⚠️ <b>{h_esc(cfg.get('warn_title') or LP_WARN_TITLE)}</b>\n\n"
+        f"👤 {mention} ({uname})\n"
+        f"🆔 <code>{fu.id}</code>\n"
+        f"📊 ওয়ার্নিং: <b>{n}/{mx}</b>\n\n"
+        f"🚫 এখানে লিংক পাঠানো নিষেধ! নিয়ম ভাঙায় আপনাকে ওয়ার্নিং দেওয়া হলো। "
+        f"{mx} বার হলে ব্যান করা হবে।"
+    )
+    await lp_send(bot, chat_id, fu.id, html, photo=cfg.get("warn_photo", True) is not False)
+
+
+async def on_link_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপ/চ্যানেলে লিংক পাঠালে (অনুমতি না থাকলে) মেসেজ মুছে Warning/Ban দেয়"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or chat.type not in ("group", "supergroup", "channel"):
+            return
+        if getattr(msg, "is_automatic_forward", False) or not has_link(msg):
+            return
+        cfg = await lp_cfg(chat.id)
+        if not cfg or not cfg.get("on"):
+            return
+        fu = msg.from_user
+        uid = None   # None = কে পাঠিয়েছে জানা যায় না (চ্যানেল পোস্ট / অ্যানোনিমাস অ্যাডমিন) → শুধু মেসেজ মুছবে
+        if chat.type != "channel" and fu is not None and msg.sender_chat is None \
+                and fu.id not in (ANON_ADMIN_ID, CHANNEL_BOT_ID):
+            uid = fu.id
+        now = time.time()
+        if uid is not None and lp_allowed(cfg, uid, now):
+            return
+        try:
+            await msg.delete()
+        except TelegramError as e:
+            logging.warning("link protect delete error (%s): %s", chat.id, e)
+        if uid is None:
+            raise ApplicationHandlerStop
+        key = (chat.id, uid)
+        if now - _lp_recent.get(key, 0) < 4:   # একসাথে কয়েকটা লিংক = একবারই শাস্তি
+            raise ApplicationHandlerStop
+        _lp_recent[key] = now
+        if len(_lp_recent) > 5000:
+            _lp_recent.clear()
+        if lp_action(cfg) == "warn":
+            mx = lp_warn_max(cfg)
+            n = await run(_lp_add_warn, chat.id, uid)
+            if n < mx:
+                await lp_warn(context.bot, chat.id, fu, cfg, n, mx)
+                raise ApplicationHandlerStop
+            try:
+                await run(_lp_clear_warn, chat.id, uid)
+            except Exception as e:
+                logging.warning("lp clear warn error: %s", e)
+        await lp_ban(context.bot, chat.id, fu, cfg)
+        raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        logging.exception("on_link_guard error")
+
+
+# ---------------------------------------------------------------
 async def notify_referrer(bot, ref_uid: int, name: str):
     try:
         await bot.send_message(
@@ -2650,6 +3506,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vn_ = view.get("n")
             if vn_ in ADM_VIEWS and is_admin(user.id):
                 return await adm_back(update, context, st, view)
+            if vn_ in LP_VIEWS:
+                return await lp_back(update, context, view)
             if vn_ == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
                 return await goto(update, context, V("create", p=0))
             if vn_ == "ar":
@@ -2670,7 +3528,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if vn_ == "vlist":
                 return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
             return await goto(update, context, V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats"):
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats", "lpc", "lpa"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
             return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
@@ -2678,6 +3536,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(user.id) and view.get("n") in ADM_VIEWS:
             if await admin_text(update, context, st, view, text):
                 return
+        if view.get("n") in LP_VIEWS:   # Link Protect মেনু
+            await lp_text(update, context, st, view, text)
+            return
+        if text == BUTTONS["linkprot"]:
+            return await goto(update, context, V("lpc", p=0))
         if text == BUTTONS["voice"]:
             return await goto(update, context, V("voice"))
         if text == BUTTONS["refer"]:
@@ -2990,6 +3853,8 @@ async def post_init(app: Application):
     try:
         state, until, msgs = await run(_bs_load)
         _BS.update(state=state, until=until, cd={"msgs": msgs} if (state == "update" and msgs) else None)
+        snap = await run(lambda: db.collection(BOT_SETTINGS).document("main").get())
+        _BS["post"] = (snap.to_dict() or {}).get("post") if (state == "update" and snap.exists) else None
     except Exception as e:
         logging.warning("bot state load error: %s", e)
     spawn(countdown_loop(app))
@@ -3032,25 +3897,31 @@ def main():
         .build()
     )
     # গেট: বট OFF/UPDATE হলে ইউজারের সব মেসেজ/বাটন এখানেই থেমে যায় (অ্যাডমিন বাদে)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, gate), group=-1)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE, gate), group=-1)
     app.add_handler(CallbackQueryHandler(gate), group=-1)
-    app.add_handler(CommandHandler(["start", "menu"], cmd_menu, filters=filters.ChatType.PRIVATE))
+    # Link Protect: গ্রুপ/চ্যানেলের লিংক ধরে (এডিট করে লিংক যোগ করলেও)। অন্য হ্যান্ডলারের আগে চলে
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.CHANNEL, on_link_guard), group=-2)
+    app.add_handler(CommandHandler(["start", "menu"], cmd_menu,
+                                   filters=filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE))
     # অ্যাডমিন প্যানেল: ফিল্টারেই শুধু ADMIN_ID এর ইউজার ঢুকতে পারে, বাকিদের জন্য হ্যান্ডলারই ট্রিগার হয় না
     app.add_handler(CommandHandler(
         "apdadmin", cmd_admin,
-        filters=filters.ChatType.PRIVATE & filters.User(user_id=list(ADMIN_IDS)),
+        filters=filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.User(user_id=list(ADMIN_IDS)),
     ))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
     app.add_handler(CallbackQueryHandler(on_cd, pattern="^cd$"))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO), on_audio))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(CallbackQueryHandler(on_pv_end, pattern="^pv_end$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & (filters.VOICE | filters.AUDIO), on_audio))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_text))
     # গ্রুপ/চ্যানেলের টেক্সট -> অটো রিপ্লাই ভয়েস
     app.add_handler(MessageHandler(
-        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
+        filters.TEXT & (filters.UpdateType.MESSAGE | filters.UpdateType.CHANNEL_POST)
+        & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
     app.run_polling(
-        allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"],
+        allowed_updates=["message", "edited_message", "channel_post", "edited_channel_post",
+                         "callback_query", "my_chat_member"],
         drop_pending_updates=True,
     )
 
