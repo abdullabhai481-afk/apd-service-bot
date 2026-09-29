@@ -2613,4 +2613,446 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ref_uid = int(m.group(1))
     async with get_lock(context, update.effective_chat.id):
         if ref_uid:
-            await 
+            await handle_referral(update, context, ref_uid)   # পয়েন্ট আগে, মেনু পরে
+        await goto(update, context, MAIN1, is_start=True)
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/APDADMIN — শুধু অ্যাডমিনের জন্য। অন্য কেউ দিলে কোনো উত্তর/এরর কিছুই যাবে না।"""
+    user = update.effective_user
+    if user is None or not is_admin(user.id):
+        return
+    try:
+        async with get_lock(context, update.effective_chat.id):
+            await goto(update, context, V("admin"))
+    except Exception:
+        logging.exception("admin panel error")
+
+
+@guarded
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    async with get_lock(context, chat_id):
+        st = await get_state(context, user.id, chat_id)
+        view = st["view"]
+
+        # ---------- নেভিগেশন বাটন ----------
+        if text == NEXT:
+            return await goto(update, context, V("main", p=2))
+        if text == PREV or text == BTN_HOME:
+            if view.get("n") == "cmp":
+                await cmp_cleanup(context, chat_id, st)
+            return await goto(update, context, MAIN1)
+        if text == BTN_BACK:
+            vn_ = view.get("n")
+            if vn_ in ADM_VIEWS and is_admin(user.id):
+                return await adm_back(update, context, st, view)
+            if vn_ == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
+                return await goto(update, context, V("create", p=0))
+            if vn_ == "ar":
+                return await goto(update, context, V("vassist"))
+            if vn_ == "argen":
+                return await goto(update, context, V("ar"))
+            if vn_ == "arset":   # Reply Settings থেকে Back = Voice Assistant মেনু
+                return await goto(update, context, V("vassist"))
+            if vn_ == "avset":
+                return await goto(update, context, V("arset", p=0))
+            if vn_ in ("avchats", "avdel"):
+                return await goto(update, context, V("avset", i=view.get("i")))
+            if vn_ == "arprompt":
+                bk = (st["mode"] or {}).get("back")
+                return await goto(update, context, bk if isinstance(bk, dict) else V("ar"))
+            if vn_ == "allv" and view.get("ar"):   # Auto Reply এর Browse থেকে Back = Generate Voice
+                return await goto(update, context, V("argen", p=0))
+            if vn_ == "vlist":
+                return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
+            return await goto(update, context, V("voice"))
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats"):
+            nv = dict(view)
+            nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
+            return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
+        # ---------- অ্যাডমিন প্যানেলের বাটন (শুধু অ্যাডমিন, বাকিদের জন্য কিছুই হবে না) ----------
+        if is_admin(user.id) and view.get("n") in ADM_VIEWS:
+            if await admin_text(update, context, st, view, text):
+                return
+        if text == BUTTONS["voice"]:
+            return await goto(update, context, V("voice"))
+        if text == BUTTONS["refer"]:
+            return await goto(update, context, V("refer"))
+        if text == BUTTONS["smm"]:
+            return await goto(update, context, V("smm"))
+        if text == BUTTONS["vassist"]:
+            return await goto(update, context, V("vassist"))
+        vn = view.get("n")
+        if text == BTN_VA_SET and vn == "vassist":
+            return await goto(update, context, V("ar"))
+        if text == BTN_VA_SETTINGS and vn == "vassist":   # অন/অফ + এডিট সিস্টেম এখানে
+            return await goto(update, context, V("arset", p=0))
+        if vn == "ar" and text == BTN_AR_GEN:
+            return await goto(update, context, V("argen", p=0))
+        # ---- Generate Voice: র‍্যান্ডম / Browse All Voices ----
+        if vn == "argen" and text == BTN_AR_RANDOM:
+            bk = V("argen", p=view.get("p", 0))
+            try:
+                v = await random_voice()
+            except Exception as e:
+                logging.warning("ar random voice error: %s", e)
+                return await goto(update, context, bk, extra=f"❌ ভয়েস লোড হয়নি ({api_error_text(e)})")
+            return await ar_pick_voice(
+                update, context, v, bk, rand=True,
+                extra=f"🎲 র‍্যান্ডম ভয়েস বাছাই হয়েছে — {v['name']}",
+            )
+        if vn == "argen" and text == BTN_AR_BROWSE:
+            return await goto(update, context, V("allv", ar=1))
+        if vn == "arprompt" and text == BTN_AR_REROLL and (st["mode"] or {}).get("rand"):
+            return await ar_reroll(update, context, st)
+        if vn == "avset" and text in AVSET_BTNS:
+            return await avset_action(update, context, st, view, text)
+        if vn == "avdel" and text in (BTN_DEL_YES, BTN_DEL_NO):
+            return await avdel_action(update, context, st, view, text)
+        if vn == "avchats" and not st["mode"]:   # রিস্টার্টের পর মোড ফিরিয়ে আনা
+            st["mode"] = {"t": "ar_chat", "i": view.get("i")}
+        if text == BUTTONS["reply"]:
+            return await goto(update, context, V("reply"))
+        if text in VA_BTNS and view.get("n") in ("vassist", "reply"):
+            return await goto(update, context, V(view["n"]), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
+        if text in SMM_BTNS and view.get("n") == "smm":
+            return await goto(update, context, V("smm"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
+        if text == BTN_ALL:
+            return await goto(update, context, V("allv"))
+        if text in (BTN_FEMALE, BTN_MALE):
+            g = "f" if text == BTN_FEMALE else "m"
+            if vn == "allv" and view.get("ar"):
+                return await goto(update, context, V("vlist", g=g, p=0, ar=1))
+            return await goto(update, context, V("vlist", g=g, p=0))
+        if text == BTN_CREATE:
+            return await goto(update, context, V("create", p=0))
+        if text == BTN_CLONE:
+            return await prompt(update, context, PROMPT_CLONE, {"t": "clone"})
+        if text == BTN_ADDID:
+            return await prompt(update, context, PROMPT_ADDID, {"t": "addid"})
+        if text == BTN_RANDOM:
+            try:
+                v = await random_voice()
+            except Exception as e:
+                logging.warning("random voice error: %s", e)
+                return await goto(update, context, V("create", p=0),
+                                  extra=f"❌ ভয়েস লোড হয়নি ({api_error_text(e)})")
+            return await start_gen(update, context, v)
+
+        # ---------- ইউজার কিছু লিখছে (মোড চালু) ----------
+        mode = st["mode"]
+        if mode:
+            t = mode["t"]
+            if t == "gen":
+                return await do_generate(update, context, st, text)
+            if t == "addid":
+                return await do_add_id(update, context, st, text)
+            if t == "send":
+                # লিস্ট থেকে গ্রুপ/চ্যানেল বাছাই
+                if mode.get("kind") == "group" and view.get("n") == "pick":
+                    c = (st["labels"] or {}).get(text)
+                    if c:
+                        return await deliver(update, context, st, c["id"], c["title"])
+                return await do_send(update, context, st, text)
+            if t == "clone":
+                return await prompt(update, context, PROMPT_CLONE, mode,
+                                    extra="⚠️ লেখা নয়, ভয়েস মেসেজ পাঠান")
+            if t == "ar_name":
+                return await do_ar_name(update, context, st, text)
+            if t == "ar_text":
+                return await do_ar_generate(update, context, st, text)
+            if t == "ar_trig":
+                return await do_ar_triggers(update, context, st, text)
+            if t == "ar_chat":
+                return await do_ar_chat_input(update, context, st, text)
+
+        # ---------- লিস্টের ভয়েস বাটন ----------
+        labels = st["labels"]
+        if labels is None:
+            try:
+                _, _, labels, _ = await render(view, st)
+            except Exception as e:
+                logging.warning("labels rebuild error: %s", e)
+                labels = {}
+            st["labels"] = labels
+        if text in labels:
+            v = labels[text]
+            n = view.get("n")
+            if n == "vlist" and view.get("ar"):   # Auto Reply: এই ভয়েস দিয়েই বানানো হবে
+                return await ar_pick_voice(
+                    update, context, v,
+                    V("vlist", g=view.get("g", "f"), p=view.get("p", 0), ar=1),
+                )
+            if n == "vlist":
+                added = await add_voice(st, {"id": v["id"], "name": v["name"], "kind": "lib"})
+                msg = f"✅ যোগ হয়েছে — {v['name']}" if added else f"ℹ️ আগেই যোগ করা আছে — {v['name']}"
+                return await goto(update, context, view, extra=msg)
+            if n == "create":
+                return await start_gen(update, context, v)
+            if n == "argen":
+                return await ar_pick_voice(update, context, v, V("argen", p=view.get("p", 0)))
+            if n == "arset":
+                return await ar_open(update, context, st, v)
+            if n == "pick":   # রিস্টার্টের পর ভয়েসের তথ্য হারিয়ে গেলে
+                return await goto(
+                    update, context, V("create", p=0),
+                    extra="ℹ️ ভয়েসের নিচের Send Group/Channel বাটনে আবার ক্লিক করুন",
+                )
+
+        # ---------- বাকি সার্ভিস বাটন ----------
+        if text in LABEL_TO_KEY:
+            mv = view if view.get("n") == "main" else MAIN1
+            return await goto(update, context, mv, text=f"{text}\n\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
+        # অন্য কোনো লেখা এলে কিছু মুছবে না
+
+
+@guarded
+async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ভয়েস ক্লোন: ইউজারের পাঠানো ভয়েস/অডিও দিয়ে Cartesia তে ক্লোন করে"""
+    msg = update.message
+    m = msg.voice or msg.audio
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    async with get_lock(context, chat_id):
+        st = await get_state(context, user.id, chat_id)
+        mode = st["mode"]
+        if not mode or mode.get("t") != "clone":
+            return
+
+        def retry(err):
+            return prompt(update, context, PROMPT_CLONE, mode, extra=err)
+
+        dur = m.duration or 0
+        if dur < CLONE_MIN_SEC:
+            return await retry(f"❌ ভয়েস খুব ছোট ({dur}s), কমপক্ষে {CLONE_MIN_SEC} সেকেন্ড দরকার")
+        if dur > CLONE_MAX_SEC:
+            return await retry(f"❌ ভয়েস অনেক বড় ({dur}s), সর্বোচ্চ {CLONE_MAX_SEC} সেকেন্ড")
+        if m.file_size and m.file_size > 15 * 1024 * 1024:
+            return await retry("❌ ফাইল অনেক বড় (সর্বোচ্চ 15MB)")
+
+        if msg.voice:
+            fname, mime = "clip.ogg", "audio/ogg"
+        else:
+            fname = m.file_name or "clip.mp3"
+            ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "mp3"
+            if ext not in CLONE_EXTS:
+                return await retry("❌ ফরম্যাট সাপোর্ট নেই (mp3, wav, ogg, flac দিন)")
+            mime = m.mime_type or "audio/mpeg"
+
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        try:
+            tg_file = await context.bot.get_file(m.file_id)
+            data = bytes(await tg_file.download_as_bytearray())
+            voices = await get_user_voices(st)
+            n = sum(1 for x in voices if x.get("kind") == "clone") + 1
+            name = f"My Clone {n}"
+            r = await HTTP.post(
+                f"{CARTESIA_URL}/voices/clone",
+                headers=_auth(),
+                data={"name": name, "language": CLONE_LANG, "access": "private"},
+                files={"clip": (fname, data, mime)},
+                timeout=180,
+            )
+            if r.status_code in (400, 422):
+                logging.warning("clone rejected: %s", r.text[:300])
+                return await retry("❌ ভয়েস ক্লোন হয়নি, স্পষ্ট ও নয়েজ-মুক্ত ভয়েস পাঠান")
+            r.raise_for_status()
+            j = r.json()
+            await add_voice(st, {"id": j["id"], "name": j.get("name") or name, "kind": "clone"})
+        except Exception as e:
+            logging.warning("clone error: %s", e)
+            return await retry(f"❌ ক্লোন করা যায়নি ({api_error_text(e)})")
+        await goto(
+            update, context, V("voice"),
+            extra=f"✅ ভয়েস ক্লোন হয়েছে — {name}\nCreate Voice এ গিয়ে ব্যবহার করুন",
+        )
+
+
+@guarded
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ভয়েসের নিচের Send Group/Channel ও Send User বাটন"""
+    q = update.callback_query
+    await q.answer()
+    msg = q.message
+    if msg is None:
+        return
+    if msg.voice:
+        fid, k = msg.voice.file_id, "voice"
+    elif msg.audio:
+        fid, k = msg.audio.file_id, "audio"
+    else:
+        return
+    kind = "group" if q.data == "send_group" else "user"
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    async with get_lock(context, chat_id):
+        await get_state(context, user.id, chat_id)
+        mode = {"t": "send", "kind": kind, "file_id": fid, "k": k}
+        if kind == "group":
+            await goto(update, context, V("pick", p=0), mode=mode)
+        else:
+            await prompt(update, context, PROMPT_USER, mode)
+
+
+async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপ/চ্যানেলে সেট করা টেক্সট মিললে সেই ভয়েস পাঠায় (Exact = হুবহু এক | Contains = মেসেজের ভেতরে থাকলেই)"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or not msg.text or len(msg.text) > 300:
+            return
+        if _BS["state"] != "on":   # বট OFF / আপডেট মোডে গ্রুপের অটো রিপ্লাইও বন্ধ
+            return
+        fu = msg.from_user
+        if fu and fu.is_bot and fu.id != 1087968824:   # অন্য বট বাদ (অ্যানোনিমাস অ্যাডমিন বাদে)
+            return
+        key = norm_key(msg.text)
+        if not key:
+            return
+        rules = await ar_rules_for(chat.id)
+        now = time.time()
+        # ১) আগে Exact মিল (হুবহু), ২) না পেলে Contains মিল (সবচেয়ে লম্বা মিলটা জেতে)
+        hit = None
+        for r in rules:
+            if r.get("on", True) and key in (r.get("keys") or ()):
+                hit = r
+                break
+        if hit is None:
+            skey = _VS_RE.sub("", key)
+            best = 0
+            for r in rules:
+                if not r.get("on", True) or r.get("match") != "contains":
+                    continue
+                for k in (r.get("keys") or ()):
+                    k = _VS_RE.sub("", k)
+                    if k and len(k) > best and contains_ok(k) and k in skey:
+                        best, hit = len(k), r
+        for r in ([hit] if hit else []):
+            ck = (chat.id, r["id"])
+            if now - _ar_last.get(ck, 0) < AR_COOLDOWN:
+                return
+            _ar_last[ck] = now
+            if len(_ar_last) > 5000:
+                _ar_last.clear()
+            send = context.bot.send_audio if r.get("k") == "audio" else context.bot.send_voice
+            arg = {"audio": r["file_id"]} if r.get("k") == "audio" else {"voice": r["file_id"]}
+            try:
+                if chat.type == "channel":
+                    await send(chat.id, **arg)
+                else:
+                    await send(chat.id, reply_parameters=ReplyParameters(
+                        message_id=msg.message_id, allow_sending_without_reply=True), **arg)
+            except TelegramError as e:
+                logging.warning("auto reply send error (%s): %s", chat.id, e)
+            return
+    except Exception:
+        logging.exception("on_chat_text error")
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """বটকে গ্রুপ/চ্যানেলে অ্যাডমিন বানালে/সরালে রেকর্ড রাখে (কে বানিয়েছে সহ)"""
+    try:
+        u = update.my_chat_member
+        chat = u.chat
+        if chat.type not in ("group", "supergroup", "channel"):
+            return
+        is_admin = u.new_chat_member.status == "administrator"
+        data = {
+            "title": chat.title or str(chat.id),
+            "type": chat.type,
+            "username": chat.username,
+            "admin": is_admin,
+            "updated": firestore.SERVER_TIMESTAMP,
+        }
+        by = u.from_user
+        if is_admin and by and not by.is_bot:
+            data["owner_id"] = by.id
+            data["owner_name"] = by.full_name
+        await run(_save_chat, chat.id, data)
+    except Exception:
+        logging.exception("my_chat_member error")
+
+
+async def post_init(app: Application):
+    global HTTP
+    HTTP = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+    _dv["lock"] = asyncio.Lock()
+    global _BS_LOCK
+    _BS_LOCK = asyncio.Lock()
+    # বটের ON/OFF/UPDATE অবস্থা ফিরিয়ে আনা (রিস্টার্টের পরেও আগের অবস্থায় থাকবে)
+    try:
+        state, until, msgs = await run(_bs_load)
+        _BS.update(state=state, until=until, cd={"msgs": msgs} if (state == "update" and msgs) else None)
+    except Exception as e:
+        logging.warning("bot state load error: %s", e)
+    spawn(countdown_loop(app))
+    # বাম পাশের 3 লাইনের "Menu" বাটন সরানো
+    try:
+        await app.bot.delete_my_commands()
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    except TelegramError as e:
+        logging.warning("menu button reset error: %s", e)
+
+
+# ---------------------------------------------------------------
+# Render + UptimeRobot এর জন্য ছোট ওয়েব সার্ভার
+# ---------------------------------------------------------------
+web = Flask(__name__)
+
+
+@web.route("/")
+def home():
+    return "Bot is running ✅"
+
+
+@web.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_web():
+    web.run(host="0.0.0.0", port=PORT)
+
+
+def main():
+    threading.Thread(target=run_web, daemon=True).start()
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)   # একজনের ভয়েস বানানো অন্যদের আটকে রাখবে না
+        .build()
+    )
+    # গেট: বট OFF/UPDATE হলে ইউজারের সব মেসেজ/বাটন এখানেই থেমে যায় (অ্যাডমিন বাদে)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, gate), group=-1)
+    app.add_handler(CallbackQueryHandler(gate), group=-1)
+    app.add_handler(CommandHandler(["start", "menu"], cmd_menu, filters=filters.ChatType.PRIVATE))
+    # অ্যাডমিন প্যানেল: ফিল্টারেই শুধু ADMIN_ID এর ইউজার ঢুকতে পারে, বাকিদের জন্য হ্যান্ডলারই ট্রিগার হয় না
+    app.add_handler(CommandHandler(
+        "apdadmin", cmd_admin,
+        filters=filters.ChatType.PRIVATE & filters.User(user_id=list(ADMIN_IDS)),
+    ))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
+    app.add_handler(CallbackQueryHandler(on_cd, pattern="^cd$"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO), on_audio))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
+    # গ্রুপ/চ্যানেলের টেক্সট -> অটো রিপ্লাই ভয়েস
+    app.add_handler(MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
+    app.run_polling(
+        allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"],
+        drop_pending_updates=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
