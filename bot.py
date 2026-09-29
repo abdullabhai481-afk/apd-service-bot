@@ -365,6 +365,34 @@ AR_MAX_TRIG = 200       # এক ভয়েসে সর্বোচ্চ ক
 AR_COOLDOWN = 3         # একই গ্রুপে একই ভয়েস কমপক্ষে কত সেকেন্ড পর পর যাবে
 AR_TTL = 300            # গ্রুপের রুল ক্যাশ (সেকেন্ড)
 
+# ---------------------------------------------------------------
+# অ্যাডমিন প্যানেল (/APDADMIN) — শুধু ADMIN_ID এর ইউজার ব্যবহার করতে পারবে
+# Render Environment এ ADMIN_ID দিন (আপনার টেলিগ্রাম নিউমেরিক ID, যেমন 123456789)
+# ADMIN_ID সেট না থাকলে কমান্ডটা কারো জন্যই কাজ করবে না (সাইলেন্ট)।
+# ---------------------------------------------------------------
+ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_ID", ""))}
+
+
+def is_admin(uid) -> bool:
+    return uid in ADMIN_IDS
+
+
+BTN_AD_USERS = "👥 All User"
+BTN_AD_REFER = "🎁 Refer Bonus"
+BTN_AD_BTNS = "🧩 Button Manage"
+BTN_AD_ADD = "➕ Add New"
+BTN_AD_CHECK = "🔗 Check All Connect G/C"
+BTN_AD_NOTICE = "📢 Notice"
+BTN_AD_CHAT = "💬 Chat"
+BTN_AD_BAN = "🚫 Ban/Block"
+BTN_AD_CAT = "🗂 Category Manage"
+BTN_AD_SET = "⚙️ Bot Settings"
+BTN_AD_UPDATE = "🛠 Bot Update Mode"
+ADMIN_BTNS = (
+    BTN_AD_USERS, BTN_AD_REFER, BTN_AD_BTNS, BTN_AD_ADD, BTN_AD_CHECK, BTN_AD_NOTICE,
+    BTN_AD_CHAT, BTN_AD_BAN, BTN_AD_CAT, BTN_AD_SET, BTN_AD_UPDATE,
+)
+
 # ভয়েসের নিচের ইনলাইন বাটন
 SEND_KB = InlineKeyboardMarkup(
     [
@@ -926,6 +954,21 @@ async def render(view, st=None, ctx=None):
     if n == "refer":
         text = await refer_text(ctx) if ctx else ""
         return text, kb([[B(BTN_HOME, NAV_STYLE)]]), labels, V("refer")
+
+    if n == "admin":
+        # নিরাপত্তা: অ্যাডমিন ছাড়া কেউ এই মেনু দেখতে পাবে না
+        if not ctx or not is_admin(ctx["user"].id):
+            return menu_text(1), main_keyboard(1), labels, MAIN1
+        rows = [
+            [B(BTN_AD_USERS), B(BTN_AD_REFER)],
+            [B(BTN_AD_BTNS), B(BTN_AD_ADD, "success")],
+            [B(BTN_AD_CHECK)],
+            [B(BTN_AD_NOTICE), B(BTN_AD_CHAT)],
+            [B(BTN_AD_BAN, "danger"), B(BTN_AD_CAT)],
+            [B(BTN_AD_SET), B(BTN_AD_UPDATE)],
+            [B(BTN_HOME, NAV_STYLE)],
+        ]
+        return "🛡 ADMIN PANEL\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V("admin")
 
     if n == "ar":
         rows = [
@@ -1854,6 +1897,18 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await goto(update, context, MAIN1, is_start=True)
 
 
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/APDADMIN — শুধু অ্যাডমিনের জন্য। অন্য কেউ দিলে কোনো উত্তর/এরর কিছুই যাবে না।"""
+    user = update.effective_user
+    if user is None or not is_admin(user.id):
+        return
+    try:
+        async with get_lock(context, update.effective_chat.id):
+            await goto(update, context, V("admin"))
+    except Exception:
+        logging.exception("admin panel error")
+
+
 @guarded
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -1895,6 +1950,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
             return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
+        # ---------- অ্যাডমিন প্যানেলের বাটন (শুধু অ্যাডমিন, বাকিদের জন্য কিছুই হবে না) ----------
+        if text in ADMIN_BTNS and is_admin(user.id) and view.get("n") == "admin":
+            return await goto(update, context, V("admin"), extra=f"{text}\n🚧 এই ফিচারটি শীঘ্রই আসছে...")
         if text == BUTTONS["voice"]:
             return await goto(update, context, V("voice"))
         if text == BUTTONS["refer"]:
@@ -2237,6 +2295,11 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler(["start", "menu"], cmd_menu, filters=filters.ChatType.PRIVATE))
+    # অ্যাডমিন প্যানেল: ফিল্টারেই শুধু ADMIN_ID এর ইউজার ঢুকতে পারে, বাকিদের জন্য হ্যান্ডলারই ট্রিগার হয় না
+    app.add_handler(CommandHandler(
+        "apdadmin", cmd_admin,
+        filters=filters.ChatType.PRIVATE & filters.User(user_id=list(ADMIN_IDS)),
+    ))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO), on_audio))
