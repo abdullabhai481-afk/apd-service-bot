@@ -25,6 +25,7 @@ from telegram import (
     LinkPreviewOptions,
     MenuButtonDefault,
     ReplyKeyboardMarkup,
+    ReplyParameters,
     Update,
 )
 from telegram.constants import ChatAction
@@ -91,6 +92,7 @@ firebase_admin.initialize_app(cred)
 db = firestore.client()
 USERS = "users"
 USER_VOICES = "user_voices"   # প্রতি ইউজারের সেভ করা ভয়েস লিস্ট (চিরস্থায়ী)
+AUTO_VOICES = "auto_voices"   # অটো রিপ্লাই ভয়েস (টেক্সট + গ্রুপ/চ্যানেল সহ)
 BOT_CHATS = "bot_chats"       # যেসব গ্রুপ/চ্যানেলে বট অ্যাডমিন (কে অ্যাডমিন বানিয়েছে সহ)
 REFER_POINTS = int(os.environ.get("REFER_POINTS", 1))   # প্রতি সফল রেফারে কত পয়েন্ট
 
@@ -182,6 +184,52 @@ def _mark_chat_inactive(chat_id: int):
     ref = db.collection(BOT_CHATS).document(str(chat_id))
     if ref.get().exists:
         ref.set({"admin": False}, merge=True)
+
+
+# ---------- অটো রিপ্লাই ভয়েস ----------
+def _ar_create(data: dict) -> str:
+    ref = db.collection(AUTO_VOICES).document()
+    ref.set(data)
+    return ref.id
+
+
+def _ar_list(uid: int):
+    out = []
+    for d in db.collection(AUTO_VOICES).where("owner_id", "==", uid).stream():
+        x = d.to_dict() or {}
+        x["id"] = d.id
+        out.append(x)
+    out.sort(key=lambda x: x.get("ts", 0))
+    return out
+
+
+def _ar_get(doc_id: str, uid=None):
+    snap = db.collection(AUTO_VOICES).document(doc_id).get()
+    if not snap.exists:
+        return None
+    x = snap.to_dict() or {}
+    if uid is not None and x.get("owner_id") != uid:
+        return None
+    x["id"] = snap.id
+    return x
+
+
+def _ar_update(doc_id: str, data: dict):
+    db.collection(AUTO_VOICES).document(doc_id).update(data)
+
+
+def _ar_delete(doc_id: str):
+    db.collection(AUTO_VOICES).document(doc_id).delete()
+
+
+def _ar_for_chat(chat_id: int):
+    out = []
+    for d in db.collection(AUTO_VOICES).where("chat_ids", "array_contains", chat_id).stream():
+        x = d.to_dict() or {}
+        x["id"] = d.id
+        out.append(x)
+    out.sort(key=lambda x: x.get("ts", 0))
+    return out
 
 
 # ---------- রেফার সিস্টেম ----------
@@ -291,6 +339,23 @@ SMM_BTNS = (BTN_SMM_TG, BTN_SMM_FB, BTN_SMM_YT, BTN_SMM_TT)
 BTN_VA_SET = "🤖 Set Auto Reply"
 BTN_VA_SETTINGS = "⚙️ Reply Settings"
 VA_BTNS = (BTN_VA_SET, BTN_VA_SETTINGS)
+
+# Set Auto Reply সাব-মেনুর বাটন (Voice Assistant)
+BTN_AR_GEN = "🎙 Generate Voice"
+BTN_AR_SET = "⚙️ Settings"
+BTN_AR_ON = "🟢 Auto Reply: ON"
+BTN_AR_OFF = "🔴 Auto Reply: OFF"
+BTN_AR_ADD = "➕ Add Texts"
+BTN_AR_REPL = "🔁 Replace Texts"
+BTN_AR_CHATS = "👥 Group/Channel"
+BTN_AR_DEL = "🗑 Delete Voice"
+BTN_DEL_YES = "✅ Yes, Delete"
+BTN_DEL_NO = "❌ Cancel"
+AVSET_BTNS = (BTN_AR_ON, BTN_AR_OFF, BTN_AR_ADD, BTN_AR_REPL, BTN_AR_CHATS, BTN_AR_DEL)
+AR_VIEWS = ("ar", "argen", "arset", "avset", "avchats", "avdel", "arprompt")
+AR_MAX_TRIG = 200       # এক ভয়েসে সর্বোচ্চ কয়টা টেক্সট
+AR_COOLDOWN = 3         # একই গ্রুপে একই ভয়েস কমপক্ষে কত সেকেন্ড পর পর যাবে
+AR_TTL = 300            # গ্রুপের রুল ক্যাশ (সেকেন্ড)
 
 # ভয়েসের নিচের ইনলাইন বাটন
 SEND_KB = InlineKeyboardMarkup(
@@ -734,6 +799,66 @@ async def prune_dead_voices(st):
 
 
 # ---------------------------------------------------------------
+# অটো রিপ্লাই: টেক্সট মেলানো (স্পেস কম-বেশি ধরা হয় না, বাকি সব হুবহু এক হতে হবে)
+# ---------------------------------------------------------------
+def norm_key(t: str) -> str:
+    t = unicodedata.normalize("NFC", t)
+    t = "".join(ch for ch in t if not ch.isspace() and unicodedata.category(ch) != "Cf")
+    return t.casefold()
+
+
+def parse_triggers(raw: str):
+    """'কি করো, কেমন আছো, খাইছো' -> [(দেখানোর টেক্সট, মেলানোর কী), ...] (কমা দিয়ে আলাদা)"""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    out, seen = [], set()
+    for part in re.split(r"[,，،\n]+", raw):
+        shown = " ".join(part.split())
+        key = norm_key(shown)
+        if not key or len(key) > 200 or key in seen:
+            continue
+        seen.add(key)
+        out.append((shown, key))
+    return out
+
+
+_AR_CACHE = {}
+_ar_last = {}
+
+
+def ar_invalidate():
+    _AR_CACHE.clear()
+
+
+async def ar_rules_for(chat_id: int):
+    hit = _AR_CACHE.get(chat_id)
+    if hit and time.time() - hit[0] < AR_TTL:
+        return hit[1]
+    rules = await run(_ar_for_chat, chat_id)
+    if len(_AR_CACHE) > 3000:
+        _AR_CACHE.clear()
+    _AR_CACHE[chat_id] = (time.time(), rules)
+    return rules
+
+
+def ar_style(it) -> str:
+    """সেট করা + চালু = সবুজ | সেট করা + বন্ধ = লাল | সেট করা হয়নি = নীল"""
+    if it.get("keys") and it.get("chat_ids"):
+        return "success" if it.get("on", True) else "danger"
+    return DEFAULT_STYLE
+
+
+def page_nav(pg: int, pages: int):
+    nav = []
+    if pg > 0:
+        nav.append(B(BTN_VPREV, NAV_STYLE))
+    if pg < pages - 1:
+        nav.append(B(BTN_VNEXT, NAV_STYLE))
+    return nav
+
+
+# ---------------------------------------------------------------
 # রেফার পেজের লেখা (HTML)
 # ---------------------------------------------------------------
 def _center(title: str, width: int) -> str:
@@ -773,6 +898,129 @@ async def render(view, st=None, ctx=None):
     if n == "refer":
         text = await refer_text(ctx) if ctx else ""
         return text, kb([[B(BTN_HOME, NAV_STYLE)]]), labels, V("refer")
+
+    if n == "ar":
+        rows = [
+            [B(BTN_AR_GEN), B(BTN_AR_SET)],
+            [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)],
+        ]
+        return "🤖 Set Auto Reply\nআপনার পছন্দের অপশনটি বেছে নিন", kb(rows), labels, V("ar")
+
+    if n == "arprompt":
+        rows = [[B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]]
+        return "নিচের Back বা Home চাপুন", kb(rows), labels, V("arprompt")
+
+    if n == "argen":
+        voices = [v for v in await get_user_voices(st) if v.get("kind") == "clone"]
+        pages = max(1, math.ceil(len(voices) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for v in voices[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            label = uniq_label("🧬", v["name"], labels)
+            labels[label] = v
+            btns.append(B(label))
+        rows = pair(btns)
+        nav = page_nav(pg, pages)
+        if nav:
+            rows.append(nav)
+        rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
+        text = "🎙 Generate Voice\nযে ক্লোন ভয়েস দিয়ে বানাতে চান সেটি বেছে নিন"
+        if not voices:
+            text += "\n\n(কোনো ক্লোন ভয়েস নেই — Voice Generate → Clone Voice থেকে আগে ক্লোন করুন)"
+        elif pages > 1:
+            text += f" ({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("argen", p=pg)
+
+    if n == "arset":
+        items = await run(_ar_list, st["uid"])
+        pages = max(1, math.ceil(len(items) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for it in items[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            label = uniq_label("🎙", it["name"], labels)
+            labels[label] = it
+            btns.append(B(label, ar_style(it)))
+        rows = pair(btns)
+        nav = page_nav(pg, pages)
+        if nav:
+            rows.append(nav)
+        rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
+        text = "⚙️ Settings\nসেট করতে চান এমন ভয়েস বেছে নিন\n🟢 চালু   🔴 বন্ধ"
+        if not items:
+            text += "\n\n(এখনো কোনো ভয়েস নেই — আগে Generate Voice থেকে বানান)"
+        elif pages > 1:
+            text += f"\n({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("arset", p=pg)
+
+    if n == "avset":
+        it = await run(_ar_get, view.get("i"), st["uid"])
+        if not it:
+            raise RuntimeError("ভয়েস পাওয়া যায়নি")
+        on = it.get("on", True)
+        trig = it.get("triggers") or []
+        shown = ", ".join(trig[:15]) + (f" … (+{len(trig) - 15})" if len(trig) > 15 else "")
+        meta = it.get("chat_meta") or {}
+        chats = ", ".join(meta.get(str(c)) or str(c) for c in (it.get("chat_ids") or []))
+        text = (
+            f"🎙 {it['name']}\n"
+            f"অবস্থা: {'🟢 ON' if on else '🔴 OFF'}\n\n"
+            f"📝 টেক্সট ({len(trig)}): {shown or 'সেট করা হয়নি'}\n"
+            f"👥 গ্রুপ/চ্যানেল: {chats or 'সেট করা হয়নি'}"
+        )
+        rows = [
+            [B(BTN_AR_ON if on else BTN_AR_OFF, "success" if on else "danger")],
+            [B(BTN_AR_ADD), B(BTN_AR_REPL)],
+            [B(BTN_AR_CHATS), B(BTN_AR_DEL)],
+            [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)],
+        ]
+        return text, kb(rows), labels, V("avset", i=it["id"])
+
+    if n == "avdel":
+        it = await run(_ar_get, view.get("i"), st["uid"])
+        if not it:
+            raise RuntimeError("ভয়েস পাওয়া যায়নি")
+        rows = [[B(BTN_DEL_YES, "danger"), B(BTN_DEL_NO)]]
+        return f"⚠️ \"{it['name']}\" ভয়েসটি মুছে ফেলবেন?", kb(rows), labels, V("avdel", i=it["id"])
+
+    if n == "avchats":
+        it = await run(_ar_get, view.get("i"), st["uid"])
+        if not it:
+            raise RuntimeError("ভয়েস পাওয়া যায়নি")
+        try:
+            owned = await run(_get_owned_chats, st["uid"])
+        except Exception as e:
+            logging.warning("owned chats error: %s", e)
+            owned = []
+        sel = set(it.get("chat_ids") or [])
+        meta = it.get("chat_meta") or {}
+        allc = {c["id"]: c for c in owned}
+        for cid in sel:
+            if cid not in allc:
+                allc[cid] = {"id": cid, "title": meta.get(str(cid)) or str(cid), "type": "group"}
+        items = sorted(allc.values(), key=lambda c: c["title"].lower())
+        pages = max(1, math.ceil(len(items) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for c in items[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            on_ = c["id"] in sel
+            pre = "✅" if on_ else ("📢" if c["type"] == "channel" else "👥")
+            label = uniq_label(pre, c["title"], labels)
+            labels[label] = c
+            btns.append(B(label, "success" if on_ else DEFAULT_STYLE))
+        rows = pair(btns)
+        nav = page_nav(pg, pages)
+        if nav:
+            rows.append(nav)
+        rows.append([B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)])
+        text = (
+            f"👥 Group/Channel — {it['name']}\n"
+            "যেসব গ্রুপ/চ্যানেলে এই ভয়েস রিপ্লাই দেবে সেগুলো ট্যাপ করে বেছে নিন\n"
+            "✅ = সেট করা আছে (আবার ট্যাপ করলে বাদ যাবে)\n"
+            "অথবা গ্রুপ/চ্যানেলের ID বা @username লিখে যোগ করুন"
+        )
+        if not items:
+            text += "\n\n(কোনো গ্রুপ/চ্যানেল পাওয়া যায়নি — বটকে অ্যাডমিন বানান, অথবা ID লিখুন)"
+        return text, kb(rows), labels, V("avchats", i=it["id"], p=pg)
 
     if n == "pick":
         err = False
@@ -1008,7 +1256,7 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
     chat_id = update.effective_chat.id
     user = update.effective_user
     st = context.bot_data.setdefault("state", {}).get(chat_id)
-    if st is None and view.get("n") in ("create", "pick"):
+    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS:
         st = await get_state(context, user.id, chat_id)
     try:
         rtext, markup, labels, view = await render(
@@ -1018,6 +1266,8 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
         logging.warning("render error: %s", e)
         if view.get("n") == "refer":
             fb, err = MAIN1, "❌ রেফার পেজ লোড হয়নি, আবার চেষ্টা করুন"
+        elif view.get("n") in AR_VIEWS:
+            fb, err = V("ar"), "❌ লোড হয়নি, আবার চেষ্টা করুন"
         else:
             fb, err = V("voice"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         rtext, markup, labels, view = await render(fb)
@@ -1205,6 +1455,235 @@ async def do_send(update, context, st, text: str):
 # ---------------------------------------------------------------
 # হ্যান্ডলার
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Auto Reply (Voice Assistant)
+# ---------------------------------------------------------------
+PROMPT_AR_NAME = "🏷 ভয়েসটির একটা নাম দিন (যেমন: Greeting 1)"
+PROMPT_AR_TEXT = "✍️ ভয়েসে যা বলাতে চান সেটা লিখুন"
+
+
+def trig_prompt(name: str, kind: str) -> str:
+    head = {
+        "first": "📝 এই ভয়েসটি কোন কোন টেক্সট দিলে রিপ্লাই দেবে সেটি বলুন",
+        "add": "➕ যে নতুন টেক্সটগুলো যোগ করতে চান সেগুলো লিখুন",
+        "repl": "🔁 নতুন টেক্সটগুলো লিখুন (আগেরগুলো বদলে যাবে)",
+    }[kind]
+    return (
+        f"{head}\n\nউদাহরণ: কি করো, কেমন আছো, খাইছো\n"
+        "(কমা দিয়ে আলাদা করে সব একসাথে লিখুন। এগুলোর যেকোনো একটা লিখলেই ভয়েস যাবে। "
+        "গ্রুপে হুবহু এই টেক্সটই লিখতে হবে, শুধু স্পেস কম-বেশি হলে সমস্যা নেই)\n\n"
+        f"🎙 {name}"
+    )
+
+
+async def ar_prompt(update, context, text, mode, extra=None):
+    return await goto(update, context, V("arprompt"), text=text, extra=extra, mode=mode)
+
+
+async def ar_open(update, context, st, item):
+    """Settings লিস্টে ভয়েসে ট্যাপ: টেক্সট সেট না থাকলে টেক্সট চাইবে, থাকলে ভয়েসের সেটিংস পেজ"""
+    it = await run(_ar_get, item["id"], st["uid"])
+    if not it:
+        return await goto(update, context, V("arset", p=0), extra="❌ ভয়েসটি পাওয়া যায়নি")
+    if not it.get("keys"):
+        return await ar_prompt(
+            update, context, trig_prompt(it["name"], "first"),
+            {"t": "ar_trig", "i": it["id"], "kind": "first", "back": V("arset", p=0)},
+        )
+    return await goto(update, context, V("avset", i=it["id"]))
+
+
+async def do_ar_name(update, context, st, text: str):
+    mode = st["mode"]
+    name = " ".join(text.split())
+    if not name or len(name) > 25:
+        return await ar_prompt(
+            update, context, f"{PROMPT_AR_NAME}\n\n🧬 {mode['cname']}", mode,
+            extra="⚠️ নাম ১ থেকে ২৫ অক্ষরের মধ্যে দিন",
+        )
+    nm = dict(mode, t="ar_text", aname=name)
+    return await ar_prompt(update, context, f"{PROMPT_AR_TEXT}\n\n🎙 {name}\n🧬 {mode['cname']}", nm)
+
+
+async def do_ar_generate(update, context, st, text: str):
+    mode = st["mode"]
+    chat_id = update.effective_chat.id
+    ptxt = f"{PROMPT_AR_TEXT}\n\n🎙 {mode['aname']}\n🧬 {mode['cname']}"
+    if len(text) > MAX_TEXT:
+        return await ar_prompt(update, context, ptxt, mode, extra=f"⚠️ লেখা অনেক বড় (সর্বোচ্চ {MAX_TEXT} অক্ষর)")
+    await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+    try:
+        text = await refine_text(text)
+        mp3 = await cartesia_tts(text, mode["cvid"])
+        audio, fname = await to_voice(mp3)
+        sent = await context.bot.send_voice(
+            chat_id, voice=InputFile(audio, filename=fname), caption=f"🎙 {mode['aname']}"
+        )
+    except Exception as e:
+        logging.warning("ar tts error: %s", e)
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            if await voice_exists(mode["cvid"]) is False:
+                n = await remove_voices(st, {mode["cvid"]})
+                note = (
+                    f"🗑 ক্লোন ভয়েসটি আর পাওয়া যায়নি, তাই লিস্ট থেকে মুছে ফেলা হয়েছে — {mode['cname']}"
+                    if n else f"❌ ক্লোন ভয়েসটি পাওয়া যায়নি — {mode['cname']}"
+                )
+                return await goto(update, context, V("argen", p=0), extra=note)
+        return await ar_prompt(update, context, ptxt, mode,
+                               extra=f"❌ ভয়েস তৈরি হয়নি ({api_error_text(e)}). আবার লিখুন")
+    st["keep"].append(sent.message_id)   # বানানো ভয়েস মোছা হবে না
+    if sent.voice:
+        fid, k = sent.voice.file_id, "voice"
+    else:
+        fid, k = sent.audio.file_id, "audio"
+    data = {
+        "owner_id": st["uid"], "name": mode["aname"], "cvid": mode["cvid"],
+        "file_id": fid, "k": k, "triggers": [], "keys": [],
+        "chat_ids": [], "chat_meta": {}, "on": True, "ts": time.time(),
+    }
+    try:
+        await run(_ar_create, data)
+    except Exception as e:
+        logging.warning("ar save error: %s", e)
+        return await goto(update, context, V("ar"), extra="❌ ভয়েসটি সেভ হয়নি, আবার চেষ্টা করুন")
+    ar_invalidate()
+    await goto(
+        update, context, V("ar"),
+        extra=f"✅ ভয়েস তৈরি হয়েছে — {mode['aname']}\n⚙️ Settings থেকে টেক্সট ও গ্রুপ/চ্যানেল সেট করুন",
+    )
+
+
+async def do_ar_triggers(update, context, st, text: str):
+    mode = st["mode"]
+    it = await run(_ar_get, mode["i"], st["uid"])
+    if not it:
+        return await goto(update, context, V("arset", p=0), extra="❌ ভয়েসটি পাওয়া যায়নি")
+    pairs = parse_triggers(text)
+    if not pairs:
+        return await ar_prompt(update, context, trig_prompt(it["name"], mode["kind"]), mode,
+                               extra="❌ কোনো টেক্সট পাওয়া যায়নি, কমা দিয়ে লিখুন")
+    if mode["kind"] == "add":
+        shown = list(it.get("triggers") or [])
+        keys = list(it.get("keys") or [])
+        for sh, ky in pairs:
+            if ky not in keys:
+                shown.append(sh)
+                keys.append(ky)
+    else:
+        shown = [p[0] for p in pairs]
+        keys = [p[1] for p in pairs]
+    if len(keys) > AR_MAX_TRIG:
+        return await ar_prompt(update, context, trig_prompt(it["name"], mode["kind"]), mode,
+                               extra=f"⚠️ সর্বোচ্চ {AR_MAX_TRIG}টি টেক্সট রাখা যায়")
+    try:
+        await run(_ar_update, it["id"], {"triggers": shown, "keys": keys})
+    except Exception as e:
+        logging.warning("ar trig save error: %s", e)
+        return await ar_prompt(update, context, trig_prompt(it["name"], mode["kind"]), mode,
+                               extra="❌ সেভ হয়নি, আবার লিখুন")
+    ar_invalidate()
+    note = f"✅ টেক্সট সেট হয়েছে (মোট {len(keys)}টি)"
+    if not it.get("chat_ids"):
+        return await goto(update, context, V("avchats", i=it["id"], p=0),
+                          extra=f"{note}\nএবার কোন গ্রুপ/চ্যানেলের জন্য হবে সেটি বেছে নিন",
+                          mode={"t": "ar_chat", "i": it["id"]})
+    return await goto(update, context, V("avset", i=it["id"]), extra=note)
+
+
+async def ar_toggle_chat(update, context, st, i, chat, force_add=False):
+    it = await run(_ar_get, i, st["uid"])
+    if not it:
+        return await goto(update, context, V("arset", p=0), extra="❌ ভয়েসটি পাওয়া যায়নি")
+    ids = list(it.get("chat_ids") or [])
+    meta = dict(it.get("chat_meta") or {})
+    cid = chat["id"]
+    if cid in ids and not force_add:
+        ids.remove(cid)
+        meta.pop(str(cid), None)
+        msg = f"➖ বাদ দেওয়া হয়েছে — {chat['title']}"
+    elif cid in ids:
+        msg = f"ℹ️ আগেই সেট করা আছে — {chat['title']}"
+    else:
+        ids.append(cid)
+        meta[str(cid)] = chat["title"]
+        msg = f"✅ সেট হয়েছে — {chat['title']}"
+    try:
+        await run(_ar_update, i, {"chat_ids": ids, "chat_meta": meta})
+    except Exception as e:
+        logging.warning("ar chat save error: %s", e)
+        msg = "❌ সেভ হয়নি, আবার চেষ্টা করুন"
+    ar_invalidate()
+    return await goto(update, context, V("avchats", i=i, p=0), extra=msg,
+                      mode={"t": "ar_chat", "i": i})
+
+
+async def do_ar_chat_input(update, context, st, text: str):
+    mode = st["mode"]
+    i = mode["i"]
+    c = (st["labels"] or {}).get(text)
+    if c:
+        return await ar_toggle_chat(update, context, st, i, c)
+
+    def again(msg):
+        return goto(update, context, V("avchats", i=i, p=0), extra=msg, mode=mode)
+
+    target = text.strip()
+    if re.fullmatch(r"-?\d+", target):
+        ref = int(target)
+    elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", target):
+        ref = "@" + target.lstrip("@")
+    else:
+        return await again("❌ ID বা @username সঠিক নয়")
+    try:
+        ch = await context.bot.get_chat(ref)
+        if ch.type not in ("group", "supergroup", "channel"):
+            return await again("❌ এটা গ্রুপ/চ্যানেল নয়")
+        m = await context.bot.get_chat_member(ch.id, update.effective_user.id)
+        if m.status not in ("creator", "administrator"):
+            return await again("❌ আপনি ওই গ্রুপ/চ্যানেলের অ্যাডমিন নন")
+    except TelegramError as e:
+        logging.warning("ar chat lookup error: %s", e)
+        return await again("❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+    chat = {"id": ch.id, "title": ch.title or str(ch.id), "type": ch.type}
+    return await ar_toggle_chat(update, context, st, i, chat, force_add=True)
+
+
+async def avset_action(update, context, st, view, text: str):
+    i = view.get("i")
+    it = await run(_ar_get, i, st["uid"])
+    if not it:
+        return await goto(update, context, V("arset", p=0), extra="❌ ভয়েসটি পাওয়া যায়নি")
+    back = V("avset", i=i)
+    if text in (BTN_AR_ON, BTN_AR_OFF):
+        now_on = not it.get("on", True)
+        await run(_ar_update, i, {"on": now_on})
+        ar_invalidate()
+        return await goto(update, context, back,
+                          extra="🟢 Auto Reply চালু হয়েছে" if now_on else "🔴 Auto Reply বন্ধ হয়েছে")
+    if text == BTN_AR_ADD:
+        return await ar_prompt(update, context, trig_prompt(it["name"], "add"),
+                               {"t": "ar_trig", "i": i, "kind": "add", "back": back})
+    if text == BTN_AR_REPL:
+        return await ar_prompt(update, context, trig_prompt(it["name"], "repl"),
+                               {"t": "ar_trig", "i": i, "kind": "repl", "back": back})
+    if text == BTN_AR_CHATS:
+        return await goto(update, context, V("avchats", i=i, p=0), mode={"t": "ar_chat", "i": i})
+    if text == BTN_AR_DEL:
+        return await goto(update, context, V("avdel", i=i))
+
+
+async def avdel_action(update, context, st, view, text: str):
+    i = view.get("i")
+    if text == BTN_DEL_NO:
+        return await goto(update, context, V("avset", i=i))
+    it = await run(_ar_get, i, st["uid"])
+    if it:
+        await run(_ar_delete, i)
+        ar_invalidate()
+    return await goto(update, context, V("arset", p=0), extra="🗑 ভয়েসটি মুছে ফেলা হয়েছে")
+
+
+# ---------------------------------------------------------------
 async def notify_referrer(bot, ref_uid: int, name: str):
     try:
         await bot.send_message(
@@ -1255,13 +1734,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == PREV or text == BTN_HOME:
             return await goto(update, context, MAIN1)
         if text == BTN_BACK:
-            if view.get("n") == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
+            vn_ = view.get("n")
+            if vn_ == "pick":   # গ্রুপ লিস্ট থেকে Back = ভয়েস তৈরির পরের রূপ
                 return await goto(update, context, V("create", p=0))
+            if vn_ == "ar":
+                return await goto(update, context, V("vassist"))
+            if vn_ in ("argen", "arset"):
+                return await goto(update, context, V("ar"))
+            if vn_ == "avset":
+                return await goto(update, context, V("arset", p=0))
+            if vn_ in ("avchats", "avdel"):
+                return await goto(update, context, V("avset", i=view.get("i")))
+            if vn_ == "arprompt":
+                bk = (st["mode"] or {}).get("back")
+                return await goto(update, context, bk if isinstance(bk, dict) else V("ar"))
             return await goto(update, context, V("allv") if view.get("n") == "vlist" else V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick"):
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
-            return await goto(update, context, nv, mode=st["mode"] if view.get("n") == "pick" else None)
+            return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
         if text == BUTTONS["voice"]:
             return await goto(update, context, V("voice"))
         if text == BUTTONS["refer"]:
@@ -1270,6 +1761,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await goto(update, context, V("smm"))
         if text == BUTTONS["vassist"]:
             return await goto(update, context, V("vassist"))
+        vn = view.get("n")
+        if text == BTN_VA_SET and vn == "vassist":
+            return await goto(update, context, V("ar"))
+        if vn == "ar" and text == BTN_AR_GEN:
+            return await goto(update, context, V("argen", p=0))
+        if vn == "ar" and text == BTN_AR_SET:
+            return await goto(update, context, V("arset", p=0))
+        if vn == "avset" and text in AVSET_BTNS:
+            return await avset_action(update, context, st, view, text)
+        if vn == "avdel" and text in (BTN_DEL_YES, BTN_DEL_NO):
+            return await avdel_action(update, context, st, view, text)
+        if vn == "avchats" and not st["mode"]:   # রিস্টার্টের পর মোড ফিরিয়ে আনা
+            st["mode"] = {"t": "ar_chat", "i": view.get("i")}
         if text == BUTTONS["reply"]:
             return await goto(update, context, V("reply"))
         if text in VA_BTNS and view.get("n") in ("vassist", "reply"):
@@ -1315,6 +1819,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if t == "clone":
                 return await prompt(update, context, PROMPT_CLONE, mode,
                                     extra="⚠️ লেখা নয়, ভয়েস মেসেজ পাঠান")
+            if t == "ar_name":
+                return await do_ar_name(update, context, st, text)
+            if t == "ar_text":
+                return await do_ar_generate(update, context, st, text)
+            if t == "ar_trig":
+                return await do_ar_triggers(update, context, st, text)
+            if t == "ar_chat":
+                return await do_ar_chat_input(update, context, st, text)
 
         # ---------- লিস্টের ভয়েস বাটন ----------
         labels = st["labels"]
@@ -1334,6 +1846,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return await goto(update, context, view, extra=msg)
             if n == "create":
                 return await start_gen(update, context, v)
+            if n == "argen":
+                return await ar_prompt(
+                    update, context, f"{PROMPT_AR_NAME}\n\n🧬 {v['name']}",
+                    {"t": "ar_name", "cvid": v["id"], "cname": v["name"], "back": V("argen", p=view.get("p", 0))},
+                )
+            if n == "arset":
+                return await ar_open(update, context, st, v)
             if n == "pick":   # রিস্টার্টের পর ভয়েসের তথ্য হারিয়ে গেলে
                 return await goto(
                     update, context, V("create", p=0),
@@ -1437,6 +1956,45 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await prompt(update, context, PROMPT_USER, mode)
 
 
+async def on_chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপ/চ্যানেলে কেউ সেট করা টেক্সট লিখলে (স্পেস বাদে হুবহু এক) সেই ভয়েস পাঠায়"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or not msg.text or len(msg.text) > 300:
+            return
+        fu = msg.from_user
+        if fu and fu.is_bot and fu.id != 1087968824:   # অন্য বট বাদ (অ্যানোনিমাস অ্যাডমিন বাদে)
+            return
+        key = norm_key(msg.text)
+        if not key:
+            return
+        rules = await ar_rules_for(chat.id)
+        now = time.time()
+        for r in rules:
+            if not r.get("on", True) or key not in (r.get("keys") or ()):
+                continue
+            ck = (chat.id, r["id"])
+            if now - _ar_last.get(ck, 0) < AR_COOLDOWN:
+                return
+            _ar_last[ck] = now
+            if len(_ar_last) > 5000:
+                _ar_last.clear()
+            send = context.bot.send_audio if r.get("k") == "audio" else context.bot.send_voice
+            arg = {"audio": r["file_id"]} if r.get("k") == "audio" else {"voice": r["file_id"]}
+            try:
+                if chat.type == "channel":
+                    await send(chat.id, **arg)
+                else:
+                    await send(chat.id, reply_parameters=ReplyParameters(
+                        message_id=msg.message_id, allow_sending_without_reply=True), **arg)
+            except TelegramError as e:
+                logging.warning("auto reply send error (%s): %s", chat.id, e)
+            return
+    except Exception:
+        logging.exception("on_chat_text error")
+
+
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """বটকে গ্রুপ/চ্যানেলে অ্যাডমিন বানালে/সরালে রেকর্ড রাখে (কে বানিয়েছে সহ)"""
     try:
@@ -1503,13 +2061,16 @@ def main():
         .concurrent_updates(True)   # একজনের ভয়েস বানানো অন্যদের আটকে রাখবে না
         .build()
     )
-    app.add_handler(CommandHandler(["start", "menu"], cmd_menu))
+    app.add_handler(CommandHandler(["start", "menu"], cmd_menu, filters=filters.ChatType.PRIVATE))
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(on_callback, pattern="^send_(group|user)$"))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_audio))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.VOICE | filters.AUDIO), on_audio))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_text))
+    # গ্রুপ/চ্যানেলের টেক্সট -> অটো রিপ্লাই ভয়েস
+    app.add_handler(MessageHandler(
+        filters.TEXT & (filters.ChatType.GROUPS | filters.ChatType.CHANNEL), on_chat_text))
     app.run_polling(
-        allowed_updates=["message", "callback_query", "my_chat_member"],
+        allowed_updates=["message", "channel_post", "callback_query", "my_chat_member"],
         drop_pending_updates=True,
     )
 
