@@ -98,6 +98,7 @@ USER_VOICES = "user_voices"   # প্রতি ইউজারের সেভ 
 AUTO_VOICES = "auto_voices"   # অটো রিপ্লাই ভয়েস (টেক্সট + গ্রুপ/চ্যানেল সহ)
 BOT_CHATS = "bot_chats"       # যেসব গ্রুপ/চ্যানেলে বট অ্যাডমিন (কে অ্যাডমিন বানিয়েছে সহ)
 BOT_SETTINGS = "bot_settings"  # বট ON/OFF/UPDATE অবস্থা + কাউন্টডাউন মেসেজ লিস্ট (রিস্টার্টেও থাকবে)
+GUARD = "bot_guard"           # প্রতি গ্রুপ/চ্যানেলের Bot Guard সেটিংস (বট ব্লক / সব মেসেজ ডিলিট / নির্দিষ্ট টেক্সট ডিলিট)
 REFER_POINTS = int(os.environ.get("REFER_POINTS", 1))   # প্রতি সফল রেফারে কত পয়েন্ট
 
 
@@ -347,6 +348,40 @@ def _wl_status(ids):
     return out
 
 
+# ---------- Bot Guard (Firestore) ----------
+def _gd_get(cid: int):
+    snap = db.collection(GUARD).document(str(cid)).get()
+    return (snap.to_dict() or {}) if snap.exists else None
+
+
+def _gd_save(cid: int, data: dict):
+    db.collection(GUARD).document(str(cid)).set(data, merge=True)
+
+
+def _gd_all_chats():
+    """বট যেসব গ্রুপ/চ্যানেলে এখনো অ্যাডমিন আছে (সবার)"""
+    out = []
+    for d in db.collection(BOT_CHATS).where("admin", "==", True).stream():
+        x = d.to_dict() or {}
+        out.append({"id": int(d.id), "title": x.get("title") or d.id, "type": x.get("type") or "group"})
+    out.sort(key=lambda c: c["title"].lower())
+    return out
+
+
+def _gd_status(ids):
+    """গ্রুপ/চ্যানেল আইডি -> কোনো গার্ড এখন চালু আছে কিনা"""
+    out = {}
+    refs = [db.collection(GUARD).document(str(i)) for i in ids]
+    if not refs:
+        return out
+    now = time.time()
+    for snap in db.get_all(refs):
+        if snap.exists:
+            cfg = snap.to_dict() or {}
+            out[int(snap.id)] = any(gd_active(cfg, m, now) for m in GD_NAMES)
+    return out
+
+
 # ---------------------------------------------------------------
 # বাটনের রঙ (টেলিগ্রাম শুধু 3টা রঙ সাপোর্ট করে)
 #   "primary" = নীল | "success" = সবুজ | "danger" = লাল
@@ -559,7 +594,25 @@ BTN_CMP_IMG = "🖼 ছবি সহ"
 BTN_CMP_POST = "✅ Post"
 BTN_CMP_SEND = "✅ Send Notice"
 BTN_CMP_CANCEL = "❌ Cancel"
-ADM_VIEWS = ("admin", "upd", "notice", "cmp", "pv")
+# --- Bot Guard (অ্যাডমিন প্যানেল): গ্রুপ/চ্যানেল বেছে বট ব্লক / সব মেসেজ ডিলিট / নির্দিষ্ট টেক্সট ডিলিট ---
+BTN_AD_GUARD = "🛡 Bot Guard"
+GD_VIEWS = ("gdc", "gd", "gdq")
+GD_NAMES = {"bots": "🤖 Bot Block", "all": "🗑 Delete All", "words": "🔤 Word Delete"}
+BTN_GD_WADD = "➕ Add Words"
+BTN_GD_WREP = "🔁 Replace Words"
+BTN_GD_WCLR = "🗑 Clear Words"
+BTN_GD_MC = "🔍 Match: Contains"      # মেসেজের ভেতরে টেক্সটটা থাকলেই ডিলিট
+BTN_GD_ME = "🎯 Match: Exact"         # মেসেজ হুবহু এক হলে ডিলিট
+BTN_GD_EX_ON = "👑 Admin Exempt: ON"
+BTN_GD_EX_OFF = "👑 Admin Exempt: OFF"
+BTN_GD_PERM = "♾ Permanent"
+GD_DUR_QUICK = {"⏱ 1 ঘন্টা": 3600, "⏱ 6 ঘন্টা": 6 * 3600, "⏱ 1 দিন": 86400,
+                "⏱ 7 দিন": 7 * 86400, "⏱ 30 দিন": 30 * 86400}
+GD_MIN_SEC = 30
+GD_MAX_SEC = 365 * 86400
+GD_MAX_WORDS = 200
+GD_TTL = 60                # গ্রুপের গার্ড সেটিংস ক্যাশ (সেকেন্ড)
+ADM_VIEWS = ("admin", "upd", "notice", "cmp", "pv") + GD_VIEWS
 BCAST_RATE = int(os.environ.get("BCAST_RATE", 25))     # টেলিগ্রাম লিমিটের নিচে থাকতে প্রতি সেকেন্ডে সর্বোচ্চ কতটা মেসেজ/এডিট
 NOTICE_INLINE_MAX = 60   # এর বেশি ইউজারকে নোটিশ গেলে ব্যাকগ্রাউন্ডে যাবে
 UPD_MIN_SEC = 10
@@ -1495,6 +1548,170 @@ async def render_wl(view, st):
 
 
 # ---------------------------------------------------------------
+# Bot Guard — হেল্পার ও মেনু রেন্ডার
+# ---------------------------------------------------------------
+def gd_active(cfg, mode, now) -> bool:
+    """এই মোড এখন চালু আছে কিনা (সময় শেষ হলে অটো বন্ধ ধরা হয়)"""
+    m = (cfg or {}).get("m_" + mode)
+    if not isinstance(m, dict) or not m.get("on"):
+        return False
+    try:
+        exp = float(m.get("exp") or 0)
+    except (TypeError, ValueError):
+        return False
+    return exp == 0 or exp > now
+
+
+def gd_left(cfg, mode, now) -> str:
+    m = (cfg or {}).get("m_" + mode) or {}
+    try:
+        exp = float(m.get("exp") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    return "♾ সবসময়" if exp == 0 else f"বাকি {fmt_left(exp - now)}"
+
+
+def gd_mode_label(mode: str, on: bool) -> str:
+    return f"{'🟢' if on else '🔴'} {GD_NAMES[mode]}: {'ON' if on else 'OFF'}"
+
+
+GD_LABELS = {gd_mode_label(m, o): m for m in GD_NAMES for o in (True, False)}
+
+
+def parse_words(raw: str):
+    """'free, hack, ফ্রি' -> ['free', 'hack', 'ফ্রি'] (কমা/নতুন লাইন দিয়ে আলাদা, ডুপ্লিকেট বাদ)"""
+    out, seen = [], set()
+    for part in re.split(r"[,，،\n]+", (raw or "").strip()):
+        shown = " ".join(part.split())
+        key = _VS_RE.sub("", norm_key(shown))
+        if not key or len(shown) > 100 or key in seen:
+            continue
+        seen.add(key)
+        out.append(shown)
+    return out
+
+
+def gd_word_hit(cfg, text: str) -> bool:
+    words = cfg.get("words") or []
+    if not words or not text:
+        return False
+    skey = _VS_RE.sub("", norm_key(text))
+    exact = cfg.get("match") == "exact"
+    for w in words:
+        k = _VS_RE.sub("", norm_key(str(w)))
+        if not k:
+            continue
+        if (skey == k) if exact else (k in skey):
+            return True
+    return False
+
+
+async def render_gd(view, st):
+    n = view.get("n")
+    labels = {}
+    nav = [B(BTN_BACK, NAV_STYLE), B(BTN_HOME, NAV_STYLE)]
+    if st is None:
+        raise RuntimeError("state নেই")
+
+    if n == "gdc":
+        try:
+            chats = await run(_gd_all_chats)
+        except Exception as e:
+            logging.warning("gd chats error: %s", e)
+            chats = []
+        try:
+            status = await run(_gd_status, [c["id"] for c in chats])
+        except Exception as e:
+            logging.warning("gd status error: %s", e)
+            status = {}
+        pages = max(1, math.ceil(len(chats) / PER_PAGE))
+        pg = min(max(int(view.get("p", 0)), 0), pages - 1)
+        btns = []
+        for c in chats[pg * PER_PAGE:(pg + 1) * PER_PAGE]:
+            on_ = status.get(c["id"], False)
+            pre = "🟢" if on_ else ("📢" if c["type"] == "channel" else "👥")
+            label = uniq_label(pre, c["title"], labels)
+            labels[label] = c
+            btns.append(B(label, "success" if on_ else DEFAULT_STYLE))
+        rows = pair(btns)
+        pn = page_nav(pg, pages)
+        if pn:
+            rows.append(pn)
+        rows.append(nav)
+        text = (
+            "🛡 Bot Guard\n"
+            "যে গ্রুপ/চ্যানেলে চালাতে চান সেটি বেছে নিন\n"
+            "অথবা গ্রুপ/চ্যানেলের ID বা @username লিখুন\n"
+            "🟢 = কোনো গার্ড চালু আছে"
+        )
+        if not chats:
+            text += "\n\n(কোনো গ্রুপ/চ্যানেল পাওয়া যায়নি — বটকে অ্যাডমিন বানান, অথবা ID লিখুন)"
+        elif pages > 1:
+            text += f"\n({pg + 1}/{pages})"
+        return text, kb(rows), labels, V("gdc", p=pg)
+
+    cid = view.get("c")
+    cfg = await run(_gd_get, cid)
+    if cfg is None:
+        raise RuntimeError("গ্রুপ/চ্যানেল পাওয়া যায়নি")
+    title = cfg.get("title") or str(cid)
+    now = time.time()
+    words = list(cfg.get("words") or [])
+    exact = cfg.get("match") == "exact"
+    exempt = cfg.get("exempt", True) is not False
+
+    if n == "gd":
+        on = {m: gd_active(cfg, m, now) for m in GD_NAMES}
+        rows = [
+            [B(gd_mode_label("bots", on["bots"]), "success" if on["bots"] else DEFAULT_STYLE),
+             B(gd_mode_label("all", on["all"]), "success" if on["all"] else DEFAULT_STYLE)],
+            [B(gd_mode_label("words", on["words"]), "success" if on["words"] else DEFAULT_STYLE)],
+            [B(BTN_GD_WADD), B(BTN_GD_WREP)],
+            [B(BTN_GD_WCLR), B(BTN_GD_ME if exact else BTN_GD_MC)],
+            [B(BTN_GD_EX_ON if exempt else BTN_GD_EX_OFF, "success" if exempt else DEFAULT_STYLE)],
+            nav,
+        ]
+        lines = [f"🛡 Bot Guard — {title}", ""]
+        for m in ("bots", "all", "words"):
+            lines.append(f"{GD_NAMES[m]}: " + (f"🟢 ON ({gd_left(cfg, m, now)})" if on[m] else "🔴 OFF"))
+        lines.append("")
+        lines.append(f"🔤 টেক্সট লিস্ট: {len(words)}টি · "
+                     + ("Exact (হুবহু এক হলে)" if exact else "Contains (ভেতরে থাকলেই)"))
+        if words:
+            lines.append(", ".join(words[:15]) + (f" …+{len(words) - 15}" if len(words) > 15 else ""))
+        lines.append("👑 Admin Exempt: " + ("ON — অ্যাডমিনদের মেসেজ ডিলিট হবে না" if exempt
+                                          else "OFF — অ্যাডমিনদের মেসেজও ডিলিট হবে"))
+        lines.append("")
+        lines.append("ℹ️ অন্য বটের মেসেজ ধরতে BotFather-এ এই বটের Bot-to-Bot Communication Mode চালু থাকতে হবে")
+        return "\n".join(lines), kb(rows), labels, V("gd", c=cid)
+
+    # n == "gdq": সময় বাছাই / টেক্সট লেখার ধাপ
+    s_ = view.get("s", "dur")
+    keep = {k: v for k, v in view.items() if k != "n"}
+    if s_ == "dur":
+        mode = view.get("m", "bots")
+        btns = [B(t) for t in GD_DUR_QUICK]
+        rows = pair(btns) + [[B(BTN_GD_PERM, "success")], nav]
+        text = (
+            f"{GD_NAMES.get(mode, '🛡')} — {title}\n"
+            "⏱ কতক্ষণের জন্য চালু থাকবে?\n\n"
+            "বাটন চাপুন অথবা লিখুন: 30m, 2h, 3d, 1d12h, ২ দিন, ৩ ঘন্টা\n"
+            "(কমপক্ষে ৩০ সেকেন্ড, সর্বোচ্চ ৩৬৫ দিন)"
+        )
+    else:   # wadd / wrep
+        rows = [nav]
+        what = "যোগ করতে" if s_ == "wadd" else "পুরনো লিস্টের বদলে বসাতে"
+        text = (
+            f"🔤 Word Delete — {title}\n"
+            f"যে টেক্সটগুলো {what} চান সেগুলো লিখুন\n"
+            "কমা (,) বা নতুন লাইন দিয়ে আলাদা করুন\n"
+            "যেমন: free fire hack, ফ্রি ডায়মন্ড, t.me/\n"
+            f"(সর্বোচ্চ {GD_MAX_WORDS}টি)"
+        )
+    return text, kb(rows), labels, V("gdq", **keep)
+
+
+# ---------------------------------------------------------------
 # মেনু রেন্ডার: (টেক্সট, কীবোর্ড, লেবেল→ভয়েস, ঠিক করা ভিউ)
 # ---------------------------------------------------------------
 async def render(view, st=None, ctx=None):
@@ -1506,6 +1723,12 @@ async def render(view, st=None, ctx=None):
 
     if n in WL_VIEWS:
         return await render_wl(view, st)
+
+    if n in GD_VIEWS:
+        # নিরাপত্তা: অ্যাডমিন ছাড়া কেউ এই মেনু দেখতে পাবে না
+        if not ctx or not is_admin(ctx["user"].id):
+            return menu_text(1), main_keyboard(1), labels, MAIN1
+        return await render_gd(view, st)
 
     if n == "refer":
         text = await refer_text(ctx) if ctx else ""
@@ -1520,6 +1743,7 @@ async def render(view, st=None, ctx=None):
             [B(BTN_AD_USERS), B(BTN_AD_REFER)],
             [B(BTN_AD_BTNS), B(BTN_AD_ADD, "success")],
             [B(BTN_AD_CHECK)],
+            [B(BTN_AD_GUARD, "danger")],
             [B(BTN_AD_NOTICE), B(BTN_AD_CHAT)],
             [B(BTN_AD_BAN, "danger"), B(BTN_AD_CAT)],
             [B(BTN_AD_SET), B(BTN_AD_UPDATE)],
@@ -1980,7 +2204,7 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
     chat_id = update.effective_chat.id
     user = update.effective_user
     st = context.bot_data.setdefault("state", {}).get(chat_id)
-    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS + LP_VIEWS + WL_VIEWS:
+    if st is None and view.get("n") in ("create", "pick") + AR_VIEWS + LP_VIEWS + WL_VIEWS + GD_VIEWS:
         st = await get_state(context, user.id, chat_id)
     try:
         rtext, markup, labels, view = await render(
@@ -1996,6 +2220,8 @@ async def goto(update: Update, context: ContextTypes.DEFAULT_TYPE, view,
             fb, err = V("main", p=2), "❌ লোড হয়নি, আবার চেষ্টা করুন"
         elif view.get("n") in WL_VIEWS:
             fb, err = MAIN1, "❌ লোড হয়নি, আবার চেষ্টা করুন"
+        elif view.get("n") in GD_VIEWS:
+            fb, err = MAIN1, "❌ Bot Guard লোড হয়নি, /apdadmin দিয়ে আবার চেষ্টা করুন"
         elif view.get("ar"):   # Auto Reply এর Browse All Voices লোড না হলে
             fb, err = V("ar"), f"❌ ভয়েস লোড হয়নি ({api_error_text(e)}), আবার চেষ্টা করুন"
         else:
@@ -2662,8 +2888,12 @@ def cmp_source(k: str):
 async def adm_back(update, context, st, view):
     """অ্যাডমিন মেনুর Back বাটন"""
     vn = view.get("n")
-    if vn in ("upd", "notice"):
+    if vn in ("upd", "notice", "gdc"):
         return await goto(update, context, V("admin"))
+    if vn == "gd":
+        return await goto(update, context, V("gdc", p=0))
+    if vn == "gdq":
+        return await goto(update, context, V("gd", c=view.get("c")))
     if vn == "pv":
         return await goto(update, context, V("upd"))
     mode = st.get("mode")
@@ -2730,7 +2960,13 @@ async def admin_text(update, context, st, view, text: str) -> bool:
     app = context.application
     chat_id = update.effective_chat.id
 
+    if vn in GD_VIEWS:
+        return await gd_text(update, context, st, view, text)
+
     if vn == "admin":
+        if text == BTN_AD_GUARD:
+            await goto(update, context, V("gdc", p=0))
+            return True
         if text in POWER_BTNS:
             turn_on = _BS["state"] != "on"       # ON→OFF, OFF/UPDATE→ON
             await set_power(app, turn_on)
@@ -3641,6 +3877,383 @@ async def on_link_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------
+# Bot Guard — মেনুর বাটন/লেখা (শুধু অ্যাডমিন প্যানেল থেকে)
+# ---------------------------------------------------------------
+_GD_CACHE = {}
+_gd_adm = {}        # (chat, user) -> (সময়, গ্রুপ-অ্যাডমিন কিনা)
+_gd_ban_try = {}    # (chat, bot) -> শেষ কবে ব্লক চেষ্টা হয়েছে
+_gd_warned = {}     # chat -> শেষ কবে ডিলিট এরর লগ হয়েছে
+
+
+def gd_invalidate(cid=None):
+    if cid is None:
+        _GD_CACHE.clear()
+    else:
+        _GD_CACHE.pop(cid, None)
+
+
+async def gd_cfg(cid: int):
+    hit = _GD_CACHE.get(cid)
+    if hit and time.time() - hit[0] < GD_TTL:
+        return hit[1]
+    cfg = await run(_gd_get, cid)
+    if len(_GD_CACHE) > 3000:
+        _GD_CACHE.clear()
+    _GD_CACHE[cid] = (time.time(), cfg)
+    return cfg
+
+
+async def gd_save(cid: int, data: dict):
+    await run(_gd_save, cid, data)
+    gd_invalidate(cid)
+
+
+async def gd_open(update, context, cid, title, ctype):
+    """বাছাই করা গ্রুপ/চ্যানেলের Bot Guard মেনু খোলে"""
+    back = V("gdc", p=0)
+    try:
+        bm = await context.bot.get_chat_member(cid, context.bot.id)
+    except TelegramError as e:
+        logging.warning("gd open member error: %s", e)
+        await goto(update, context, back, extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+        return
+    if bm.status != "administrator":
+        await goto(update, context, back, extra="❌ বট ওই গ্রুপ/চ্যানেলে অ্যাডমিন নয় — আগে বটকে অ্যাডমিন বানান")
+        return
+    try:
+        await gd_save(cid, {"title": title, "type": ctype})
+    except Exception as e:
+        logging.warning("gd save error: %s", e)
+        await goto(update, context, back, extra="❌ সেভ হয়নি, আবার চেষ্টা করুন")
+        return
+    note = await lp_perm_note(context.bot, cid, ctype)
+    await goto(update, context, V("gd", c=cid), extra=note or None)
+
+
+async def gd_ban(bot, cid: int, u, force: bool = False) -> bool:
+    """অন্য বটকে ব্লক (ban) করার চেষ্টা। না হলে False (তখন শুধু মেসেজ ডিলিট চলবে)"""
+    key, now = (cid, u.id), time.time()
+    if not force and now - _gd_ban_try.get(key, 0) < 600:
+        return False
+    if len(_gd_ban_try) > 5000:
+        _gd_ban_try.clear()
+    _gd_ban_try[key] = now
+    try:
+        await bot.ban_chat_member(cid, u.id)
+        return True
+    except TelegramError as e:
+        logging.warning("guard bot ban error (%s/%s): %s", cid, u.id, e)
+        return False
+
+
+async def gd_scan_bots(bot, cid: int) -> str:
+    """চালু করার সময় আগে থেকে থাকা অ্যাডমিন-বটগুলো ব্লক করার চেষ্টা (সাধারণ মেম্বার বট লিস্ট করা যায় না)"""
+    try:
+        admins = await bot.get_chat_administrators(cid, api_kwargs={"return_bots": True})
+    except TelegramError as e:
+        logging.warning("guard scan admins error (%s): %s", cid, e)
+        return ""
+    skip = (bot.id, ANON_ADMIN_ID, CHANNEL_BOT_ID)
+    found = [a.user for a in admins if a.user.is_bot and a.user.id not in skip]
+    if not found:
+        return ""
+    ok = 0
+    for u in found:
+        if await gd_ban(bot, cid, u, force=True):
+            ok += 1
+    msg = f"🤖 অ্যাডমিন বট পাওয়া গেছে {len(found)}টি — ব্লক হয়েছে {ok}টি"
+    if ok < len(found):
+        msg += "\n⚠️ বাকিগুলো ব্লক হয়নি (যে অ্যাডমিন বটকে আপনার বট প্রমোট করেনি তাকে সরানো যায় না) — তাদের মেসেজ ডিলিট হবে"
+    return msg
+
+
+async def gd_text(update, context, st, view, text: str) -> bool:
+    """Bot Guard মেনুর সব বাটন ও লেখা। এই মেনুগুলোতে থাকলে সবসময় True"""
+    n = view.get("n")
+    cid = view.get("c")
+    now = time.time()
+
+    def go(v, **kw):
+        return goto(update, context, v, **kw)
+
+    # ---------- গ্রুপ/চ্যানেল বাছাই ----------
+    if n == "gdc":
+        lb = st["labels"]
+        if lb is None:
+            try:
+                _, _, lb, _ = await render(view, st, {"user": update.effective_user, "bot": context.bot.username})
+            except Exception as e:
+                logging.warning("gd labels rebuild error: %s", e)
+                lb = {}
+            st["labels"] = lb
+        c = lb.get(text)
+        if c:
+            await gd_open(update, context, c["id"], c["title"], c["type"])
+            return True
+        target = text.strip()
+        if re.fullmatch(r"-?\d+", target):
+            ref = int(target)
+        elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,}", target):
+            ref = "@" + target.lstrip("@")
+        else:
+            await go(V("gdc", p=view.get("p", 0)), extra="❌ ID বা @username সঠিক নয়")
+            return True
+        try:
+            ch = await context.bot.get_chat(ref)
+        except TelegramError as e:
+            logging.warning("gd chat lookup error: %s", e)
+            await go(V("gdc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি — বট সেখানে অ্যাডমিন আছে কিনা দেখুন")
+            return True
+        if ch.type not in ("group", "supergroup", "channel"):
+            await go(V("gdc", p=0), extra="❌ এটা গ্রুপ/চ্যানেল নয়")
+            return True
+        await gd_open(update, context, ch.id, ch.title or str(ch.id), ch.type)
+        return True
+
+    cfg = await run(_gd_get, cid)
+    if cfg is None:
+        await go(V("gdc", p=0), extra="❌ গ্রুপ/চ্যানেল পাওয়া যায়নি")
+        return True
+
+    # ---------- গ্রুপের গার্ড মেনু ----------
+    if n == "gd":
+        mode = GD_LABELS.get(text)
+        if mode:
+            if gd_active(cfg, mode, now):
+                await gd_save(cid, {"m_" + mode: {"on": False, "exp": 0}})
+                await go(V("gd", c=cid), extra=f"🔴 {GD_NAMES[mode]} বন্ধ হয়েছে")
+            elif mode == "words" and not cfg.get("words"):
+                await go(V("gdq", c=cid, s="wadd", t=1), extra="আগে যে টেক্সটগুলো ডিলিট করতে চান সেগুলো দিন")
+            else:
+                await go(V("gdq", c=cid, s="dur", m=mode))
+        elif text in (BTN_GD_WADD, BTN_GD_WREP):
+            await go(V("gdq", c=cid, s="wadd" if text == BTN_GD_WADD else "wrep"))
+        elif text == BTN_GD_WCLR:
+            if not cfg.get("words"):
+                await go(V("gd", c=cid), extra="ℹ️ টেক্সট লিস্ট আগে থেকেই খালি")
+            else:
+                await gd_save(cid, {"words": [], "m_words": {"on": False, "exp": 0}})
+                await go(V("gd", c=cid), extra="🗑 টেক্সট লিস্ট মুছে গেছে (Word Delete বন্ধ হয়েছে)")
+        elif text in (BTN_GD_MC, BTN_GD_ME):
+            to_exact = text == BTN_GD_MC
+            await gd_save(cid, {"match": "exact" if to_exact else "contains"})
+            await go(V("gd", c=cid), extra="🎯 এখন: হুবহু এক হলে ডিলিট" if to_exact else "🔍 এখন: মেসেজের ভেতরে থাকলেই ডিলিট")
+        elif text in (BTN_GD_EX_ON, BTN_GD_EX_OFF):
+            to_on = text == BTN_GD_EX_OFF
+            await gd_save(cid, {"exempt": to_on})
+            await go(V("gd", c=cid), extra="👑 অ্যাডমিনদের মেসেজ এখন ডিলিট হবে না" if to_on
+                     else "👑 অ্যাডমিনদের মেসেজও এখন ডিলিট হবে")
+        return True
+
+    # ---------- n == "gdq" ----------
+    s_ = view.get("s", "dur")
+    if s_ == "dur":
+        mode = view.get("m")
+        if mode not in GD_NAMES:
+            await go(V("gd", c=cid))
+            return True
+        if text == BTN_GD_PERM:
+            secs = 0
+        elif text in GD_DUR_QUICK:
+            secs = GD_DUR_QUICK[text]
+        else:
+            secs = parse_duration(text, GD_MIN_SEC, GD_MAX_SEC)
+        if secs is None:
+            await go(dict(view), extra="❌ সময় বোঝা যায়নি — যেমন: 30m, 2h, 3d, 1d12h")
+            return True
+        await gd_save(cid, {"m_" + mode: {"on": True, "exp": 0 if secs == 0 else now + secs}})
+        msg = f"🟢 {GD_NAMES[mode]} চালু হয়েছে — " + ("♾ সবসময়" if secs == 0 else fmt_left(secs))
+        if mode == "bots":
+            scan = await gd_scan_bots(context.bot, cid)
+            if scan:
+                msg += "\n" + scan
+        note = await lp_perm_note(context.bot, cid, cfg.get("type"))
+        if note:
+            msg += "\n" + note
+        await go(V("gd", c=cid), extra=msg)
+        return True
+
+    # wadd / wrep: টেক্সট লিস্ট
+    items = parse_words(text)
+    if not items:
+        await go(dict(view), extra="❌ কোনো টেক্সট পাওয়া যায়নি — কমা দিয়ে লিখুন")
+        return True
+    base = list(cfg.get("words") or []) if s_ == "wadd" else []
+    seen = {_VS_RE.sub("", norm_key(w)) for w in base}
+    for w in items:
+        k = _VS_RE.sub("", norm_key(w))
+        if k not in seen:
+            seen.add(k)
+            base.append(w)
+    base = base[:GD_MAX_WORDS]
+    await gd_save(cid, {"words": base})
+    if view.get("t"):
+        await go(V("gdq", c=cid, s="dur", m="words"), extra=f"✅ {len(base)}টি টেক্সট সেভ হয়েছে")
+    else:
+        await go(V("gd", c=cid), extra=f"✅ টেক্সট লিস্টে এখন {len(base)}টি")
+    return True
+
+
+# ---------------------------------------------------------------
+# Bot Guard — গ্রুপ/চ্যানেলে আসল কাজ: বট ব্লক / সব মেসেজ ডিলিট / নির্দিষ্ট টেক্সট ডিলিট
+# ---------------------------------------------------------------
+_SERVICE_ATTRS = (
+    "new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+    "group_chat_created", "supergroup_chat_created", "channel_chat_created", "migrate_to_chat_id",
+    "migrate_from_chat_id", "pinned_message", "message_auto_delete_timer_changed", "video_chat_started",
+    "video_chat_ended", "video_chat_scheduled", "video_chat_participants_invited", "forum_topic_created",
+    "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited", "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+)
+
+
+def is_service_msg(msg) -> bool:
+    return any(getattr(msg, a, None) for a in _SERVICE_ATTRS)
+
+
+async def gd_is_chat_admin(bot, cid: int, uid: int) -> bool:
+    key, now = (cid, uid), time.time()
+    hit = _gd_adm.get(key)
+    if hit and now - hit[0] < 300:
+        return hit[1]
+    try:
+        m = await bot.get_chat_member(cid, uid)
+        ok = m.status in ("creator", "administrator")
+    except TelegramError:
+        ok = False
+    if len(_gd_adm) > 5000:
+        _gd_adm.clear()
+    _gd_adm[key] = (now, ok)
+    return ok
+
+
+async def gd_exempt(bot, cfg, chat, msg) -> bool:
+    """Admin Exempt চালু থাকলে গ্রুপ/চ্যানেলের অ্যাডমিন ও বটের মালিকের মেসেজ ছাড় পায়"""
+    if cfg.get("exempt", True) is False:
+        return False
+    if getattr(msg, "is_automatic_forward", False) or chat.type == "channel":
+        return True
+    if msg.sender_chat is not None and msg.sender_chat.id == chat.id:   # অ্যানোনিমাস অ্যাডমিন
+        return True
+    fu = msg.from_user
+    if fu is None:
+        return False
+    if fu.id == ANON_ADMIN_ID or is_admin(fu.id):
+        return True
+    return await gd_is_chat_admin(bot, chat.id, fu.id)
+
+
+async def gd_delete(msg, cid: int) -> bool:
+    try:
+        await msg.delete()
+        return True
+    except TelegramError as e:
+        now = time.time()
+        if now - _gd_warned.get(cid, 0) > 600:   # একই এরর বারবার লগে না আসার জন্য
+            _gd_warned[cid] = now
+            logging.warning("guard delete error (%s): %s — বটকে Delete Messages পারমিশন দিন", cid, e)
+        return False
+
+
+async def on_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """গ্রুপ/চ্যানেলের প্রতিটি মেসেজে Bot Guard চেক (Link Protect এর আগে চলে)"""
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        if msg is None or chat is None or chat.type not in ("group", "supergroup", "channel"):
+            return
+        cfg = await gd_cfg(chat.id)
+        if not cfg:
+            return
+        now = time.time()
+        m_bots = gd_active(cfg, "bots", now)
+        m_all = gd_active(cfg, "all", now)
+        m_words = gd_active(cfg, "words", now)
+        if not (m_bots or m_all or m_words):
+            return
+        bot = context.bot
+        fu = msg.from_user
+        if fu is not None and fu.id == bot.id:
+            return
+        skip = (bot.id, ANON_ADMIN_ID, CHANNEL_BOT_ID)
+
+        # ১) বট অ্যাড হলে (সার্ভিস মেসেজ) ব্লক
+        if m_bots and msg.new_chat_members:
+            hit_bot = False
+            for u in msg.new_chat_members:
+                if u.is_bot and u.id not in skip:
+                    hit_bot = True
+                    await gd_ban(bot, chat.id, u, force=True)
+            if hit_bot:
+                spawn(safe_delete(bot, chat.id, msg.message_id))
+                raise ApplicationHandlerStop   # ওয়েলকাম ইত্যাদি কোনো মেসেজ যাবে না
+
+        service = is_service_msg(msg)
+
+        # ২) অন্য বটের মেসেজ (ব্লক হোক বা না হোক, মেসেজ সাথে সাথে ডিলিট)
+        if m_bots and not service:
+            other = fu is not None and fu.is_bot and fu.id not in skip
+            via = getattr(msg, "via_bot", None)
+            via_hit = via is not None and via.id != bot.id and not await gd_exempt(bot, cfg, chat, msg)
+            if other or via_hit:
+                if other:
+                    await gd_ban(bot, chat.id, fu)
+                await gd_delete(msg, chat.id)
+                raise ApplicationHandlerStop
+
+        # ৩) সার্ভিস মেসেজ (জয়েন/লিভ ইত্যাদি): Delete All চালু থাকলে মোছা হয়, তবে ওয়েলকাম বন্ধ হয় না
+        if service:
+            if m_all:
+                spawn(safe_delete(bot, chat.id, msg.message_id))
+                raise ApplicationHandlerStop   # Delete All চলাকালে ওয়েলকাম/লিভ মেসেজও যাবে না
+            return
+
+        if not (m_all or m_words):
+            return
+        if await gd_exempt(bot, cfg, chat, msg):
+            return
+
+        # ৪) সব মেসেজ / নির্দিষ্ট টেক্সট
+        hit = m_all
+        if not hit and m_words:
+            hit = gd_word_hit(cfg, msg.text or msg.caption or "")
+        if hit:
+            await gd_delete(msg, chat.id)
+            raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        logging.exception("on_guard error")
+
+
+async def on_guard_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """জয়েন/লিভ (chat_member আপডেট — সার্ভিস মেসেজ লুকানো থাকলেও আসে):
+    বট ঢুকলে নীরবে ব্লক; Delete All চালু থাকলে ওয়েলকাম/লিভ মেসেজও বন্ধ"""
+    try:
+        u = update.chat_member
+        if u is None or u.chat.type not in ("group", "supergroup"):
+            return
+        nm = u.new_chat_member
+        user_ = nm.user
+        if user_.id in (context.bot.id, ANON_ADMIN_ID, CHANNEL_BOT_ID):
+            return
+        cfg = await gd_cfg(u.chat.id)
+        if not cfg:
+            return
+        now = time.time()
+        if user_.is_bot and nm.status in ("member", "administrator", "restricted") \
+                and gd_active(cfg, "bots", now):
+            await gd_ban(context.bot, u.chat.id, user_, force=True)
+            raise ApplicationHandlerStop   # ব্লক হওয়া বটের জন্য ওয়েলকাম যাবে না
+        if gd_active(cfg, "all", now):
+            raise ApplicationHandlerStop   # Delete All চলাকালে বট কোনো মেসেজ পাঠাবে না
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        logging.exception("on_guard_member error")
+
+
+# ---------------------------------------------------------------
 # ---------------------------------------------------------------
 # Welcome Message — মেনু, সেটিংস ও জয়েন হলে ওয়েলকাম পাঠানো
 # ---------------------------------------------------------------
@@ -4078,7 +4691,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if vn_ == "vlist":
                 return await goto(update, context, V("allv", ar=1) if view.get("ar") else V("allv"))
             return await goto(update, context, V("voice"))
-        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats", "lpc", "lpa", "wlc"):
+        if text in (BTN_VPREV, BTN_VNEXT) and view.get("n") in ("vlist", "create", "pick", "argen", "arset", "avchats", "lpc", "lpa", "wlc", "gdc"):
             nv = dict(view)
             nv["p"] = max(0, int(view.get("p", 0)) + (-1 if text == BTN_VPREV else 1))
             return await goto(update, context, nv, mode=st["mode"] if view.get("n") in ("pick", "avchats") else None)
@@ -4456,6 +5069,9 @@ def main():
     app.add_handler(CallbackQueryHandler(gate), group=-1)
     # Link Protect: গ্রুপ/চ্যানেলের লিংক ধরে (এডিট করে লিংক যোগ করলেও)। অন্য হ্যান্ডলারের আগে চলে
     app.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.CHANNEL, on_link_guard), group=-2)
+    # Bot Guard: বট ব্লক / সব মেসেজ ডিলিট / নির্দিষ্ট টেক্সট ডিলিট (সবার আগে চলে)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.CHANNEL, on_guard), group=-3)
+    app.add_handler(ChatMemberHandler(on_guard_member, ChatMemberHandler.CHAT_MEMBER), group=-3)
     app.add_handler(CommandHandler(["start", "menu"], cmd_menu,
                                    filters=filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE))
     # অ্যাডমিন প্যানেল: ফিল্টারেই শুধু ADMIN_ID এর ইউজার ঢুকতে পারে, বাকিদের জন্য হ্যান্ডলারই ট্রিগার হয় না
