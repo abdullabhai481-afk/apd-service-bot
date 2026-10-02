@@ -4131,6 +4131,9 @@ async def gd_exempt(bot, cfg, chat, msg) -> bool:
     """Admin Exempt চালু থাকলে গ্রুপ/চ্যানেলের অ্যাডমিন ও বটের মালিকের মেসেজ ছাড় পায়"""
     if cfg.get("exempt", True) is False:
         return False
+    fu0 = msg.from_user
+    if fu0 is not None and fu0.is_bot and fu0.id not in (bot.id, ANON_ADMIN_ID, CHANNEL_BOT_ID):
+        return False   # অন্য বট অ্যাডমিন হলেও ছাড় পাবে না (Admin Exempt শুধু মানুষ অ্যাডমিনের জন্য)
     if getattr(msg, "is_automatic_forward", False) or chat.type == "channel":
         return True
     if msg.sender_chat is not None and msg.sender_chat.id == chat.id:   # অ্যানোনিমাস অ্যাডমিন
